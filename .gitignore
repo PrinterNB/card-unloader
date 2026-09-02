@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller (only produced if you use the optional EXE build)
+build/
+dist/
+*.spec
+
+# Your personal config (paths differ per machine — don't commit)
+config.json
+
+# OS clutter
+Thumbs.db
+Desktop.ini
