@@ -23,9 +23,9 @@ That's it. Close the settings window.
 
 | File | What it does |
 |---|---|
-| `card_unloader.pyw` | Main flow — run via the **Unload Card** desktop icon |
-| `config_ui.pyw` | Settings GUI — run via **Card Unloader Settings** desktop icon |
-| `config.json` | Your saved settings (created automatically) |
+| `card_unloader.pyw` | The program you run every day. Does the actual card detection, copying, and backup — i.e. the **Unload Card** desktop icon. |
+| `config_ui.pyw` | The one-time setup window where you pick your folders and Lightroom path — i.e. the **Card Unloader Settings** desktop icon. You only open this when something needs changing. |
+| `config.json` | Where your saved settings live (created automatically when you first click Save). |
 
 ## Optional: standalone EXE
 

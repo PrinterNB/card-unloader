@@ -10,6 +10,7 @@ env/
 build/
 dist/
 *.spec
+Card Unloader.exe
 
 # Your personal config (paths differ per machine — don't commit)
 config.json
