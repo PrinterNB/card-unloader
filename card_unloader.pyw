@@ -26,15 +26,98 @@ def load_config():
         return json.load(f)
 
 
-def find_removable_drives():
-    """Return drive root paths (e.g. ['E:\\', 'F:\\']) for all removable drives."""
-    results = []
+def _drive_type(path):
+    return ctypes.windll.kernel32.GetDriveTypeW(path)
+
+
+def _candidate_drives():
+    """Return {drive_path: type_code} for drives a camera card could show up as.
+
+    That's any removable drive, or any *fixed* drive other than the internal
+    Windows drive — CFexpress/NVMe readers frequently register as fixed.
+    """
+    sys_drive = os.environ.get("SystemDrive", "C:").rstrip("\\").upper()
+    out = {}
     for letter in ascii_uppercase:
         path = f"{letter}:\\"
-        if os.path.exists(path):
-            if ctypes.windll.kernel32.GetDriveTypeW(path) == 2:  # DRIVE_REMOVABLE
-                results.append(path)
-    return results
+        t = _drive_type(path)  # 0 when the letter isn't in use
+        if t not in (2, 3):  # removable or fixed
+            continue
+        if t == 3 and letter + ":" == sys_drive:
+            continue
+        out[path] = t
+    return out
+
+
+def _has_entries(path):
+    try:
+        return any(os.scandir(path))
+    except OSError:
+        return False
+
+
+def wait_for_card(root):
+    """Show a 'plug in your card' dialog and wait until a card drive appears.
+
+    Triggers when either a new card-type drive letter shows up, or a drive
+    that was present but empty starts containing files (card readers like
+    many CFexpress ones hold a permanent drive letter and only fill up when
+    a card is inserted). Returns the drive root path, or None if cancelled.
+    """
+    baseline = _candidate_drives()
+    had_content = {p: _has_entries(p) for p in baseline}
+    result = [None]
+    cancelled = [False]
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Card Unloader")
+    dialog.resizable(False, False)
+    dialog.attributes("-topmost", True)
+    tk.Label(
+        dialog, text="Waiting for your camera card…\n\nPlug it in now.",
+        justify="center",
+    ).pack(pady=(18, 10), padx=24)
+
+    def do_cancel():
+        cancelled[0] = True
+        dialog.destroy()
+
+    tk.Button(dialog, text="Cancel", command=do_cancel).pack(pady=(0, 14))
+
+    def poll():
+        if cancelled[0]:
+            return
+        now = _candidate_drives()
+        found = []
+        for p in sorted(now):
+            if p not in baseline:
+                found.append(p)  # new drive letter
+            elif not had_content[p] and _has_entries(p):
+                found.append(p)  # permanent reader that just got a card
+        if found:
+            dialog.destroy()
+            if len(found) == 1:
+                result[0] = found[0]
+            else:
+                result[0] = pick_drive(root, found)
+            return
+        dialog.after(500, poll)
+
+    dialog.grab_set()
+    dialog.after(500, poll)
+    dialog.wait_window()
+    return result[0]
+
+
+def _is_hidden(path):
+    """True for dotfiles or files/folders with the Windows Hidden attribute."""
+    if os.path.basename(path).startswith("."):
+        return True
+    try:
+        attrs = os.stat(path).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return bool(attrs & 0x2)  # FILE_ATTRIBUTE_HIDDEN
 
 
 def unique_dest(dest_dir, filename):
@@ -108,28 +191,19 @@ def run_unload(root):
         )
         return
 
-    # --- Detect camera card ---
-    drives = find_removable_drives()
-    if not drives:
-        messagebox.showerror(
-            "Card Unloader",
-            "No camera card detected.\n\nInsert your card and try again.",
-            parent=root,
-        )
+    # --- Wait for camera card ---
+    card_path = wait_for_card(root)
+    if card_path is None:
         return
-
-    if len(drives) == 1:
-        card_path = drives[0]
-    else:
-        card_path = pick_drive(root, drives)
-        if card_path is None:
-            return
     card_path = card_path.rstrip("\\") + "\\"
 
-    # --- Scan card for matching files ---
+    # --- Scan card for matching files (skip hidden files & folders) ---
     matched = []
-    for dirpath, _, files in os.walk(card_path):
+    for dirpath, dirs, files in os.walk(card_path):
+        dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
         for fname in files:
+            if _is_hidden(os.path.join(dirpath, fname)):
+                continue
             ext = os.path.splitext(fname)[1].upper().lstrip(".")
             if ext in extensions:
                 matched.append(Path(dirpath) / fname)

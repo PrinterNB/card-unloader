@@ -9,8 +9,9 @@ env/
 # PyInstaller (only produced if you use the optional EXE build)
 build/
 dist/
-*.spec
 Card Unloader.exe
+_internal/
+*.spec
 
 # Your personal config (paths differ per machine — don't commit)
 config.json

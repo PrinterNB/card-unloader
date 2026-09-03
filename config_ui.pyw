@@ -10,10 +10,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "config.json"
-# Where the standalone exe lives (same folder as this file), and where PyInstaller
-# outputs it before we move it into place.
-EXE_PATH = SCRIPT_DIR / "Card Unloader.exe"
-DIST_EXE = SCRIPT_DIR / "dist" / "Card Unloader.exe"
+# The standalone app is one single exe, built with PyInstaller in --onefile
+# mode. Everything (the app, its libraries, config.json) is packed inside the
+# one exe; it unpacks itself to a temp folder each time it runs, so there is
+# no _internal folder to keep beside it. A save-as dialog asks where to put
+# the exe after each build (default: right next to config_ui.pyw).
+EXE_NAME = "Card Unloader.exe"
+EXE_PATH = SCRIPT_DIR / EXE_NAME  # default save location (if the picker is cancelled)
+BUILT_EXE = SCRIPT_DIR / "dist" / EXE_NAME  # where PyInstaller first builds it
 
 DEFAULT_CONFIG = {
     "extensions": ["CR2", "CR3", "NEF", "RAF", "ARW", "DNG", "JPG", "JPEG"],
@@ -51,22 +55,22 @@ def find_lightroom():
     return None
 
 
-def _pythonw_path():
-    d = os.path.dirname(sys.executable)
-    pw = os.path.join(d, "pythonw.exe")
-    return pw if os.path.isfile(pw) else sys.executable
+def build_exe(save_path):
+    """Build a standalone 'Card Unloader' exe and save it at save_path.
 
-
-def build_exe():
-    """Build a standalone Card Unloader.exe via PyInstaller, then move it out of
-    dist/ next to this file.
-
+    --onefile mode: everything (the app, its libraries, config.json) is
+    packed into a single Card Unloader.exe. On each launch it unpacks itself
+    to a temp folder, so there's no _internal folder to keep beside it.
+    PyInstaller builds into dist/, and the one exe is copied to save_path
+    wherever the user chose.
     Returns (True, exe_path) on success, (False, error_text) on failure.
     """
+    save_path = Path(save_path)
     pyw = SCRIPT_DIR / "card_unloader.pyw"
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onefile", "--noconsole",
+        "--onefile",
+        "--noconsole",
         "--name", "Card Unloader",
         # Absolute path — PyInstaller resolves relative --add-data against the
         # .spec directory, which we put in build/, not the project root.
@@ -79,69 +83,19 @@ def build_exe():
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SCRIPT_DIR))
     if r.returncode != 0:
         return False, r.stderr.strip()[-2000:] or f"PyInstaller exit code {r.returncode}"
-    if not DIST_EXE.exists():
-        return False, f"Build reported success but {DIST_EXE} was not produced."
-    # Move the built exe next to config_ui.pyw (remove any previous copy first).
+    if not BUILT_EXE.exists():
+        return False, f"Build reported success but {BUILT_EXE} was not produced."
+
+    # Copy the one exe to the chosen path, replacing anything already there.
     try:
-        if EXE_PATH.exists():
-            EXE_PATH.unlink()
-        shutil.move(str(DIST_EXE), str(EXE_PATH))
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(BUILT_EXE), str(save_path))
     except OSError as e:
-        return False, f"Built, but couldn't move the exe into place: {e}"
-    return True, str(EXE_PATH)
-
-
-def create_shortcuts():
-    """Create two desktop shortcuts via a temporary VBS script.
-
-    "Unload Card" targets the standalone exe when it has been built, otherwise
-    falls back to running card_unloader.pyw via pythonw. Returns an error string
-    on failure, or None on success.
-    """
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    pythonw = _pythonw_path()
-    config_script = str(SCRIPT_DIR / "config_ui.pyw")
-    script_dir = str(SCRIPT_DIR)
-
-    if EXE_PATH.exists():
-        unload_target = str(EXE_PATH)
-        unload_args = ""
-    else:
-        unload_target = pythonw
-        unload_args = f'"{SCRIPT_DIR}\\card_unloader.pyw"'
-
-    lines = [
-        'Set ws = CreateObject("WScript.Shell")',
-        "",
-        f'Set sc = ws.CreateShortcut("{desktop}\\Unload Card.lnk")',
-        f'sc.TargetPath = "{unload_target}"',
-        f'sc.Arguments = "{unload_args}"',
-        f'sc.WorkingDirectory = "{script_dir}"',
-        'sc.Description = "Card Unloader - Unload Camera Card"',
-        "sc.Save",
-        "",
-        f'Set sc = ws.CreateShortcut("{desktop}\\Card Unloader Settings.lnk")',
-        f'sc.TargetPath = "{pythonw}"',
-        f'sc.Arguments = "{config_script}"',
-        f'sc.WorkingDirectory = "{script_dir}"',
-        'sc.Description = "Card Unloader - Settings"',
-        "sc.Save",
-    ]
-
-    vbs = SCRIPT_DIR / "_tmp_shortcuts.vbs"
-    vbs.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-    try:
-        r = subprocess.run(
-            ["cscript", "//nologo", str(vbs)],
-            capture_output=True, text=True, timeout=15,
-        )
-        if r.returncode != 0:
-            return r.stderr.strip() or f"cscript exit code {r.returncode}"
-    except Exception as e:
-        return str(e)
-    finally:
-        vbs.unlink(missing_ok=True)
-    return None
+        return False, f"Built the exe but couldn't save it to {save_path}: {e}"
+    shutil.rmtree(SCRIPT_DIR / "dist", ignore_errors=True)
+    if not save_path.exists():
+        return False, f"Build reported success but {save_path} was not produced."
+    return True, str(save_path)
 
 
 class ConfigApp:
@@ -211,7 +165,6 @@ class ConfigApp:
         # --- Action buttons ---
         btns = ttk.Frame(root); btns.pack(pady=20)
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=5)
-        ttk.Button(btns, text="Create Desktop Shortcuts", command=self._make_shortcuts).pack(side="left", padx=5)
         ttk.Button(btns, text="Build Standalone EXE", command=self._build_exe).pack(side="left", padx=5)
 
     # --- Browse handlers ---
@@ -321,46 +274,35 @@ class ConfigApp:
                 )
                 return
 
-        messagebox.showinfo(
-            "Build Standalone EXE",
-            "Building a standalone exe\u2026\nThis can take a minute.",
+        # Ask where to save the single exe. Cancelling falls back to the
+        # project folder next to config_ui.pyw.
+        save_path = filedialog.asksaveasfilename(
+            title="Where should Card Unloader.exe be saved?",
+            initialfile=str(EXE_PATH),
+            defaultextension=".exe",
+            filetypes=[("Executable", "*.exe")],
             parent=self.root,
         )
-        ok, info = build_exe()
+        if not save_path:
+            save_path = EXE_PATH
+        save_path = Path(save_path)
+
+        messagebox.showinfo(
+            "Build Standalone EXE",
+            "Building a standalone exe\u2026\nThis can take a minute.\n\n"
+            f"It will be saved as:\n{save_path}",
+            parent=self.root,
+        )
+        ok, info = build_exe(save_path)
         if ok:
-            err = create_shortcuts()
-            if err:
-                messagebox.showwarning(
-                    "Build Standalone EXE",
-                    f"EXE built:\n{info}\n\n(But the shortcut update failed:\n{err})",
-                    parent=self.root,
-                )
-            else:
-                messagebox.showinfo(
-                    "Build Standalone EXE",
-                    f"Done.\n\nStandalone app:\n{info}\n\n"
-                    "The 'Unload Card' desktop shortcut now points to it.",
-                    parent=self.root,
-                )
+            messagebox.showinfo(
+                "Build Standalone EXE",
+                f"Done.\n\nStandalone app:\n{info}\n\n"
+                "It's a single file \u2014 copy it anywhere you like.",
+                parent=self.root,
+            )
         else:
             messagebox.showerror("Build Standalone EXE", f"Build failed:\n\n{info}", parent=self.root)
-
-    def _make_shortcuts(self):
-        err = create_shortcuts()
-        if err:
-            messagebox.showerror(
-                "Desktop Shortcuts",
-                f"Failed to create shortcuts:\n\n{err}",
-                parent=self.root,
-            )
-        else:
-            messagebox.showinfo(
-                "Desktop Shortcuts",
-                "Created on your desktop:\n\n"
-                "\u2022 Unload Card\n"
-                "\u2022 Card Unloader Settings",
-                parent=self.root,
-            )
 
 
 def main():
