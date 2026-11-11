@@ -22,3 +22,6 @@ Desktop.ini
 
 # Run diagnostics (Finder apps have no stdout)
 card_unloader.log
+
+# macOS clutter
+.DS_Store
