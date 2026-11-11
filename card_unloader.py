@@ -1,5 +1,14 @@
-"""Card Unloader — one-click SD card photo unloader (macOS)."""
+"""Card Unloader — one-click SD card photo unloader (macOS).
+
+One visible window walks the user through every stage — waiting for the card,
+scanning, copying to the primary folder, removing the card, backup copy,
+Lightroom — with a live status line and progress bar. All prompts are buttons
+in this one window (no blocking message dialogs, no hidden root windows).
+Every run is logged to card_unloader.log next to the app, since a Finder-
+launched app has no stdout.
+"""
 import json
+import logging
 import os
 import re
 import shutil
@@ -7,7 +16,6 @@ import subprocess
 import sys
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
 
 if getattr(sys, "frozen", False):
     # Running as a PyInstaller-built app; config.json is embedded and extracted here.
@@ -16,13 +24,16 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = BASE_DIR
 CONFIG_FILE = BASE_DIR / "config.json"
+LOG_FILE = SCRIPT_DIR / "card_unloader.log"
 
 VOLUMES_ROOT = "/Volumes"
-# Camera cards are FAT32/exFAT formatted (DCF spec), and some readers report
-# Mac-format or NTFS. The Mac's own disks are apfs/hfs, network shares smbfs/
-# afp/nfs — anything else mounted under /Volumes is a card candidate.
-CARD_FSTYPES = {"msdos", "msdosx", "exfat", "vfat", "fat", "fat32", "ntfs", "ntfs-3g", "hfs", "hfsplus"}
+# Camera cards are FAT32/exFAT (DCF spec). The Mac's own disks are apfs/hfs,
+# network shares are smbfs/afp/nfs — anything card-formatted under /Volumes
+# is a candidate.
+CARD_FSTYPES = {"msdos", "msdosx", "exfat", "vfat", "fat", "fat32", "ntfs", "ntfs-3g"}
 
+
+# ---------- config & filesystem helpers (no Tk involved) ----------
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -34,10 +45,9 @@ def load_config():
 def _mounted_volumes():
     """Return {mount_point: fstype} for everything mounted, via /sbin/mount.
 
-    Each line looks like:  msdos on /Volumes/UNTITLED (msdos, local, nodev, …)
-    Device and mount-point names can contain spaces (e.g. SMB shares), so the
+    Lines look like:  msdos on /Volumes/UNTITLED (msdos, local, nodev, …)
+    Device and mount-point names can contain spaces (SMB shares), so the
     fields are matched lazily up to " on " and the "(flags)" tail.
-    Returns None if /sbin/mount couldn't be read.
     """
     try:
         r = subprocess.run(["/sbin/mount"], capture_output=True, text=True, timeout=5)
@@ -52,15 +62,9 @@ def _mounted_volumes():
 
 
 def _candidate_volumes():
-    """Return {volume_path: fstype} for drives a camera card could show up as.
-
-    That's a card-formatted filesystem mounted under /Volumes. The internal
-    Macintosh HD disks are apfs, network shares are smbfs/afp/nfs, and plain
-    folders that happen to live in /Volumes (not mounts) are skipped.
-    """
+    """Return {volume_path: fstype} for drives a camera card could show up as."""
     mounts = _mounted_volumes()
-    if mounts is None:
-        # Fallback: any real mount point under /Volumes.
+    if mounts is None:  # /sbin/mount unreadable: accept any mount under /Volumes
         out = {}
         try:
             for e in os.scandir(VOLUMES_ROOT):
@@ -89,19 +93,18 @@ def _has_entries(path):
 
 
 def _has_dcim(path):
-    """True if path (or one folder inside it) contains a DCIM folder.
+    """True if path (or one folder inside it) holds a DCIM folder.
 
-    Camera cards follow the DCF spec and hold their photos in DCIM/, so this
-    tells a real card apart from a FAT-formatted external drive that happens
-    to be mounted at startup.
+    Camera cards follow the DCF spec (photos live in DCIM/), which tells a
+    real card apart from a FAT-formatted external drive at a glance.
     """
     try:
-        entries = [e for e in os.scandir(path) if e.is_dir()]
+        dirs = [e for e in os.scandir(path) if e.is_dir()]
     except OSError:
         return False
-    if any(e.name.lower() == "dcim" for e in entries):
+    if any(e.name.lower() == "dcim" for e in dirs):
         return True
-    for e in entries:
+    for e in dirs:
         try:
             if any(e2.name.lower() == "dcim" for e2 in os.scandir(e.path) if e2.is_dir()):
                 return True
@@ -110,72 +113,10 @@ def _has_dcim(path):
     return False
 
 
-def wait_for_card(root):
-    """Show a 'plug in your card' dialog and wait until a card volume appears.
-
-    A card already mounted when the app started is detected immediately if it
-    looks like a camera card (DCIM folder) — otherwise triggers when either a
-    new card volume shows up under /Volumes, or a volume that was present but
-    empty starts containing files (some readers keep a permanent mount point
-    and only fill up when a card is inserted). Returns the volume root path,
-    or None if cancelled.
-    """
-    baseline = _candidate_volumes()
-    had_content = {p: _has_entries(p) for p in baseline}
-    result = [None]
-    cancelled = [False]
-
-    already = [p for p in sorted(baseline) if had_content[p] and _has_dcim(p)]
-    if already:
-        return already[0] if len(already) == 1 else pick_drive(root, already)
-
-    dialog = tk.Toplevel(root)
-    dialog.title("Card Unloader")
-    dialog.resizable(False, False)
-    dialog.attributes("-topmost", True)
-    tk.Label(
-        dialog, text="Waiting for your camera card…\n\nPlug it in now.",
-        justify="center",
-    ).pack(pady=(18, 10), padx=24)
-
-    def do_cancel():
-        cancelled[0] = True
-        dialog.destroy()
-
-    tk.Button(dialog, text="Cancel", command=do_cancel).pack(pady=(0, 14))
-
-    def poll():
-        if cancelled[0]:
-            return
-        now = _candidate_volumes()
-        found = []
-        for p in sorted(now):
-            if p not in baseline:
-                found.append(p)  # new card volume
-            elif not had_content[p] and _has_entries(p):
-                found.append(p)  # permanent mount point that just got a card
-        if found:
-            dialog.destroy()
-            if len(found) == 1:
-                result[0] = found[0]
-            else:
-                result[0] = pick_drive(root, found)
-            return
-        dialog.after(500, poll)
-
-    dialog.grab_set()
-    dialog.after(500, poll)
-    dialog.wait_window()
-    return result[0]
-
-
 def _is_hidden(path):
-    """True for dotfiles or MacOS X resource forks / AppleDouble files."""
-    if os.path.basename(path).startswith("."):
-        return True
-    if os.path.basename(path).startswith("._"):
-        return True  # AppleDouble sidecar (e.g. ._IMG_1234.CR3)
-    return False
+    """True for dotfiles, AppleDouble sidecars, and card housekeeping dirs."""
+    name = os.path.basename(path)
+    return name.startswith(".") or name == "lost+found"
 
 
 def unique_dest(dest_dir, filename):
@@ -189,39 +130,28 @@ def unique_dest(dest_dir, filename):
     return p
 
 
-def pick_drive(root, drives):
-    """Toplevel dialog to pick which card to unload. Returns path or None."""
-    dialog = tk.Toplevel(root)
-    dialog.title("Select Camera Card")
-    dialog.resizable(False, False)
-    dialog.attributes("-topmost", True)
-    tk.Label(dialog, text="Multiple cards detected. Select one:").pack(pady=(10, 5))
-    lb = tk.Listbox(dialog, height=min(len(drives), 8), width=40)
-    for d in drives:
-        lb.insert(tk.END, Path(d).name or d)
-    lb.selection_set(0)
-    lb.pack(pady=5)
-    result = [None]
-
-    def on_ok():
-        sel = lb.curselection()
-        if sel:
-            result[0] = drives[sel[0]]
-        dialog.destroy()
-
-    tk.Button(dialog, text="Unload", command=on_ok).pack(pady=5)
-    dialog.grab_set()
-    dialog.wait_window()
-    return result[0]
+def _copy_file(src, dest):
+    """Copy a file; never raise. Falls back to content-only when metadata
+    (timestamps, xattrs) is rejected — typical on SMB/network-backed folders.
+    Returns False only if the data itself could not be written."""
+    try:
+        shutil.copy2(src, dest)
+        return True
+    except OSError:
+        try:
+            shutil.copyfile(src, dest)
+            return True
+        except OSError as e:
+            logging.warning("copy failed: %s -> %s: %s", src, dest, e)
+            return False
 
 
 def _app_wrapper(path):
-    """Return the .app bundle at or above path, or None.
+    """The .app bundle at or above path, or None.
 
-    Users can browse straight into Contents/MacOS — Adobe apps must not be
-    exec'd from there (nested helper bundles live beside the main exe), so
-    any path inside a bundle is normalized up to the bundle itself and
-    launched via Finder.
+    Users can browse into a bundle (Contents/MacOS/…); Adobe apps must not be
+    exec'd from there, so any path inside a bundle is normalized up to the
+    bundle itself and launched via Finder.
     """
     parts = Path(path).parts
     for i, part in enumerate(parts):
@@ -233,7 +163,6 @@ def _app_wrapper(path):
 
 
 def _is_launchable(path):
-    """True for a Lightroom .app bundle, a path inside one, or an executable."""
     if _app_wrapper(path):
         return True
     p = Path(path)
@@ -249,184 +178,261 @@ def _launch(path):
         subprocess.Popen([str(path)])
 
 
-def _copy_file(src, dest):
-    """Copy with metadata; fall back to content-only on filesystems that
-    reject them (SMB shares, some external drives). False = both failed."""
-    try:
-        shutil.copy2(src, dest)
-        return True
-    except OSError:
-        try:
-            shutil.copyfile(src, dest)
-            return True
-        except OSError:
-            return False
+# ---------- the one-window UI ----------
 
-
-class StatusWindow:
-    """Floating panel showing the current stage and a progress bar."""
-
-    BAR_W = 220
+class App:
+    """Root window that shows the current stage + progress bar, and waits
+    on button clicks. Nothing in here blocks outside buttons()/update loop."""
+    BAR_W = 240
 
     def __init__(self, root):
-        w = tk.Toplevel(root)
-        w.title("Card Unloader")
-        w.attributes("-topmost", True)
-        w.resizable(False, False)
-        self.label = tk.Label(w, justify="left")
-        self.label.pack(padx=14, pady=(12, 6))
-        self.canvas = tk.Canvas(w, height=18, width=self.BAR_W + 6, border=0)
-        self.canvas.pack(padx=14, pady=(2, 12))
-        self.w = w
+        self.root = root
+        root.title("Card Unloader")
+        root.attributes("-topmost", True)
+        self.text = tk.Label(root, justify="left", wraplength=420)
+        self.text.pack(padx=18, pady=(16, 8))
+        self.canvas = tk.Canvas(root, height=18, width=self.BAR_W + 16, border=0)
+        self.canvas.pack(padx=18, pady=(4, 14))
+        self._frac = None
 
-    def set(self, text, frac=None):
-        """Show stage text; draw the bar when frac (0..1) is given."""
-        self.label.configure(text=text)
+    def stage(self, text, frac=None):
+        """Set status line; draw the bar when frac (0..1) given."""
+        self._frac = frac
+        self.text.configure(text=text)
+        self._redraw_bar()
+        self.root.update_idletasks()
+        logging.info("stage: %s", text.replace("\n", " | "))
+
+    def _redraw_bar(self):
         c = self.canvas
         c.delete("all")
-        if frac is not None:
-            frac = min(max(frac, 0.0), 1.0)
-            x0, y0 = 4, 3
-            c.create_rectangle(x0, y0, x0 + self.BAR_W, y0 + 12, outline="#808080")
-            c.create_rectangle(x0, y0, x0 + int(self.BAR_W * frac), y0 + 12, fill="#4a90d9")
-        self.w.update_idletasks()
-
-    def close(self):
-        self.w.destroy()
-
-
-def run_unload(root):
-    config = load_config()
-    if config is None:
-        messagebox.showerror(
-            "Card Unloader",
-            "Configuration not found.\n\n"
-            "Open “Card Unloader Settings” to set up your folders first.",
-            parent=root,
-        )
-        return
-
-    extensions = {e.upper().lstrip(".") for e in config.get("extensions", [])}
-    primary_dest = config.get("primary_destination", "").strip()
-    backup_dest = config.get("backup_destination", "").strip()
-    lightroom = config.get("lightroom_path", "").strip()
-
-    if not primary_dest:
-        messagebox.showerror(
-            "Card Unloader",
-            "Primary destination is not set.\n\n"
-            "Open “Card Unloader Settings” to configure.",
-            parent=root,
-        )
-        return
-
-    if not os.path.isdir(primary_dest):
-        messagebox.showerror(
-            "Card Unloader",
-            f"Primary destination not found:\n{primary_dest}\n\n"
-            "Open “Card Unloader Settings” to fix this.",
-            parent=root,
-        )
-        return
-
-    # --- Wait for camera card ---
-    card_path = wait_for_card(root)
-    if card_path is None:
-        return
-    card_root = Path(card_path)
-
-    # --- Scan, copy, backup with a live status panel ---
-    status = StatusWindow(root)
-    try:
-        status.set("Scanning your card…")
-        matched = []
-        for dirpath, dirs, files in os.walk(card_root):
-            dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
-            for fname in files:
-                if _is_hidden(os.path.join(dirpath, fname)):
-                    continue
-                ext = os.path.splitext(fname)[1].upper().lstrip(".")
-                if ext in extensions:
-                    matched.append(Path(dirpath) / fname)
-
-        if not matched:
-            ext_list = ", ".join(f".{e}" for e in sorted(extensions))
-            messagebox.showinfo(
-                "Card Unloader",
-                f"No matching files found on card.\n\nLooked for: {ext_list}",
-                parent=root,
-            )
+        if self._frac is None:
             return
+        frac = min(max(self._frac, 0.0), 1.0)
+        x0, y0 = 8, 4
+        c.create_rectangle(x0, y0, x0 + self.BAR_W, y0 + 12, outline="#808080")
+        c.create_rectangle(x0, y0, x0 + int(self.BAR_W * frac), y0 + 12, fill="#4a90d9")
 
-        # --- Copy to primary destination ---
-        primary = Path(primary_dest)
-        total = len(matched)
+    def buttons(self, options):
+        """Show buttons for {label: value}; block until one is clicked.
+
+        Returns the value of the clicked button. Button widgets are removed
+        afterwards so the window reads cleanly at the next stage.
+        """
+        self._choice = None
+        made = []
+        for label, value in options.items():
+            def click(v=value):
+                self._choice = v
+            b = tk.Button(self.root, text=label, command=click)
+            b.pack(pady=(0, 8))
+            made.append(b)
+        while self._choice is None:
+            self.root.update()  # processes clicks; raises if the app is quit
+        for b in made:
+            b.destroy()
+        return self._choice
+
+    def wait_for_volume(self):
+        """Detect the camera card. Returns its volume root, or None if cancelled.
+
+        Already-mounted cards are detected immediately (only when they look
+        like camera cards — DCIM); otherwise poll until a new card-formatted
+        volume mounts, or a present-but-empty one fills up.
+        """
+        baseline = _candidate_volumes()
+        had = {p: _has_entries(p) for p in baseline}
+        already = [p for p in sorted(baseline) if had[p] and _has_dcim(p)]
+        if already:
+            logging.info("card already mounted at launch: %s", already)
+            return already[0] if len(already) == 1 else self.pick_volume(already)
+
+        self.stage("Waiting for your camera card…\n\nPlug it in now.")
+        self._done = False
+        cancel = tk.Button(self.root, text="Cancel",
+                           command=lambda: setattr(self, "_done", True))
+        cancel.pack(pady=(0, 8))
+        self._card = None
+
+        def poll():
+            if self._done:
+                return
+            now = _candidate_volumes()
+            found = []
+            for p in sorted(now):
+                if p not in baseline:
+                    found.append(p)  # new card volume mounted
+                elif not had[p] and _has_entries(p):
+                    found.append(p)  # permanent mount point just got a card
+            if found:
+                logging.info("card volumes detected: %s", found)
+                self._card = found[0] if len(found) == 1 else self.pick_volume(found)
+                self._done = True
+                return
+            self.root.after(500, poll)
+
+        poll()
+        while not self._done:
+            self.root.update()
+        cancel.destroy()
+        return self._card
+
+    def pick_volume(self, volumes):
+        """Multiple cards mounted: show one button per volume, return choice."""
+        self.stage(
+            "Multiple cards detected.\n\nClick the one you want to unload:"
+        )
+        options = {Path(v).name: v for v in volumes}
+        if len(options) < len(volumes):  # name collision: fall back to full path
+            options = {v: v for v in volumes}
+        return self.buttons(options)
+
+    def copy_many(self, files, dest_dir, stage_label):
+        """Copy each file to dest_dir (unique names), live progress bar.
+
+        Returns (copied_paths, [failed file names]).
+        """
+        dest_dir = Path(dest_dir)
+        total = max(len(files), 1)
         copied, failed = [], []
-        for i, f in enumerate(matched, 1):
-            dest = unique_dest(primary, f.name)
+        for i, f in enumerate(files, 1):
+            dest = unique_dest(dest_dir, Path(f).name)
             if _copy_file(f, dest):
                 copied.append(dest)
             else:
-                failed.append(f"{f.name} → primary")
-            status.set(f"Copying to primary — {i} of {total}", i / total)
+                failed.append(Path(f).name)
+            self.stage(f"{stage_label} — {i} of {total}", i / total)
+        return copied, failed
 
-        if not copied:
-            messagebox.showerror(
-                "Card Unloader",
-                f"Could not copy any files to:\n{primary_dest}\n\n"
-                "Check the folder exists and is writable.",
-                parent=root,
-            )
-            return
 
-        # --- Card can be removed ---
-        messagebox.showinfo(
-            "Card Unloader",
-            f"{len(copied)} files copied to:\n{primary_dest}\n\n"
-            "You can safely remove the card.",
-            parent=root,
+# ---------- the flow ----------
+
+def run_unload(app):
+    cfg = load_config()
+    if cfg is None:
+        app.stage(
+            "Configuration not found.\n\n"
+            "Open “Card Unloader Settings” to set up your folders first."
         )
+        app.buttons({"Quit": None})
+        return
 
-        # --- Copy to backup ---
-        if backup_dest and os.path.isdir(backup_dest):
-            if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
-                backup = Path(backup_dest)
-                n = len(copied)
-                status.set(f"Copying to backup — 0 of {n}")
-                for j, f in enumerate(copied, 1):
-                    dest = unique_dest(backup, f.name)
-                    if not _copy_file(f, dest):
-                        failed.append(f"{f.name} → backup")
-                    status.set(f"Copying to backup — {j} of {n}", j / n)
+    extensions = {e.upper().lstrip(".") for e in cfg.get("extensions", [])}
+    primary_dest = cfg.get("primary_destination", "").strip()
+    backup_dest = cfg.get("backup_destination", "").strip()
+    lightroom = cfg.get("lightroom_path", "").strip()
+    logging.info("config: exts=%s primary=%r backup=%r lr=%r",
+                 sorted(extensions), primary_dest, backup_dest, lightroom)
 
-        # --- Launch Lightroom? ---
-        if lightroom and _is_launchable(lightroom):
-            if messagebox.askyesno("Card Unloader", "Launch Lightroom?", parent=root):
-                status.set("Launching Lightroom…")
-                _launch(lightroom)
+    if not primary_dest:
+        app.stage(
+            "Primary destination is not set.\n\n"
+            "Open “Card Unloader Settings” to configure."
+        )
+        app.buttons({"Quit": None})
+        return
 
-        # --- Done ---
-        done_text = f"Done — {len(copied)} files processed."
-        if failed:
-            done_text += (
-                f"\n\n{len(failed)} could not be copied (destination permission or disk issue):\n"
-                + "\n".join(f"• {t}" for t in failed[:8])
-            )
-        messagebox.showinfo("Card Unloader", done_text, parent=root)
-    finally:
-        status.close()
+    if not os.path.isdir(primary_dest):
+        app.stage(
+            f"Primary destination not found:\n{primary_dest}\n\n"
+            "Open “Card Unloader Settings” to fix this."
+        )
+        app.buttons({"Quit": None})
+        return
+
+    # --- Wait for camera card ---
+    card_path = app.wait_for_volume()
+    if card_path is None:
+        app.stage("Cancelled — nothing was copied.")
+        return
+    card_root = Path(card_path)
+    app.stage(f"Card detected: {Path(card_path).name}\n\nScanning your card…")
+
+    # --- Scan card for matching files (skip hidden files & folders) ---
+    matched = []
+    for dirpath, dirs, files in os.walk(card_root):
+        dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
+        for fname in files:
+            if _is_hidden(os.path.join(dirpath, fname)):
+                continue
+            ext = os.path.splitext(fname)[1].upper().lstrip(".")
+            if ext in extensions:
+                matched.append(Path(dirpath) / fname)
+
+    if not matched:
+        ext_list = ", ".join(f".{e}" for e in sorted(extensions))
+        app.stage(f"No matching files found on card.\n\nLooked for: {ext_list}")
+        app.buttons({"Quit": None})
+        return
+    logging.info("matched %d files on %s", len(matched), card_root)
+
+    # --- Copy to primary destination ---
+    copied, failed = app.copy_many(matched, primary_dest, "Copying to primary")
+    if not copied:
+        app.stage(
+            f"Could not copy any files to:\n{primary_dest}\n\n"
+            "Check the folder exists and is writable."
+        )
+        app.buttons({"Quit": None})
+        return
+
+    # --- Card can be removed ---
+    app.stage(
+        f"{len(copied)} files copied to:\n{primary_dest}\n\n"
+        "You can safely remove the card."
+    )
+    app.buttons({"Continue": None})
+
+    # --- Copy to backup ---
+    if backup_dest and os.path.isdir(backup_dest):
+        if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
+            _, bfailed = app.copy_many(copied, backup_dest, "Copying to backup")
+            failed.extend(bfailed)
+        else:
+            logging.info("backup same as primary; skipped")
+
+    # --- Launch Lightroom? ---
+    if lightroom and _is_launchable(lightroom):
+        app.stage(f"Copies done. Launch Lightroom?\n\n{lightroom}")
+        if app.buttons({"Yes": True, "No": False}):
+            app.stage("Launching Lightroom…")
+            _launch(lightroom)
+
+    # --- Done ---
+    done_text = f"Done — {len(copied)} files processed."
+    if failed:
+        done_text += (
+            f"\n\n{len(failed)} files could not be copied "
+            "(destination permission or disk issue):\n"
+            + "\n".join(f"• {name}" for name in failed[:8])
+        )
+    app.stage(done_text)
+    logging.info("session complete: copied=%d failed=%d", len(copied), len(failed))
+    app.buttons({"Quit": None})
 
 
 def main():
+    logging.basicConfig(
+        filename=str(LOG_FILE),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
     root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+    app = App(root)
     try:
-        run_unload(root)
-    except Exception as e:
-        messagebox.showerror("Card Unloader", f"Something went wrong:\n\n{e}", parent=root)
+        run_unload(app)
+    except Exception as e:  # last-resort: log + show, never die silently
+        logging.exception("session crashed")
+        app.stage(f"Something went wrong:\n\n{e}\n\n(The error was logged.)")
+        try:
+            app.buttons({"Quit": None})
+        except Exception:
+            pass
     finally:
-        root.destroy()
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
