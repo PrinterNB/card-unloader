@@ -1,22 +1,27 @@
-"""Card Unloader — one-click SD card photo unloader."""
-import ctypes
+"""Card Unloader — one-click SD card photo unloader (macOS)."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from string import ascii_uppercase
 import tkinter as tk
 from tkinter import messagebox
 
 if getattr(sys, "frozen", False):
-    # Running as a PyInstaller-built exe; config.json is embedded and extracted here.
+    # Running as a PyInstaller-built app; config.json is embedded and extracted here.
     BASE_DIR = Path(getattr(sys, "_MEIPASS"))
 else:
     BASE_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = BASE_DIR
 CONFIG_FILE = BASE_DIR / "config.json"
+
+VOLUMES_ROOT = "/Volumes"
+# Camera cards are FAT32/exFAT formatted (DCF spec), and some readers report
+# Mac-format or NTFS. The Mac's own disks are apfs/hfs, network shares smbfs/
+# afp/nfs — anything else mounted under /Volumes is a card candidate.
+CARD_FSTYPES = {"msdos", "msdosx", "exfat", "vfat", "fat", "fat32", "ntfs", "ntfs-3g", "hfs", "hfsplus"}
 
 
 def load_config():
@@ -26,26 +31,52 @@ def load_config():
         return json.load(f)
 
 
-def _drive_type(path):
-    return ctypes.windll.kernel32.GetDriveTypeW(path)
+def _mounted_volumes():
+    """Return {mount_point: fstype} for everything mounted, via /sbin/mount.
 
-
-def _candidate_drives():
-    """Return {drive_path: type_code} for drives a camera card could show up as.
-
-    That's any removable drive, or any *fixed* drive other than the internal
-    Windows drive — CFexpress/NVMe readers frequently register as fixed.
+    Each line looks like:  msdos on /Volumes/UNTITLED (msdos, local, nodev, …)
+    Mount points can contain spaces; device/fstype names never do.
+    Returns None if /sbin/mount couldn't be read.
     """
-    sys_drive = os.environ.get("SystemDrive", "C:").rstrip("\\").upper()
+    try:
+        r = subprocess.run(["/sbin/mount"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
     out = {}
-    for letter in ascii_uppercase:
-        path = f"{letter}:\\"
-        t = _drive_type(path)  # 0 when the letter isn't in use
-        if t not in (2, 3):  # removable or fixed
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(\S+) on (.+) \(([^()]+)\)\s*$", line)
+        if m:
+            out[m.group(2)] = m.group(3).split(",")[0]
+    return out
+
+
+def _candidate_volumes():
+    """Return {volume_path: fstype} for drives a camera card could show up as.
+
+    That's a card-formatted filesystem mounted under /Volumes. The internal
+    Macintosh HD disks are apfs, network shares are smbfs/afp/nfs, and plain
+    folders that happen to live in /Volumes (not mounts) are skipped.
+    """
+    mounts = _mounted_volumes()
+    if mounts is None:
+        # Fallback: any real mount point under /Volumes.
+        out = {}
+        try:
+            for e in os.scandir(VOLUMES_ROOT):
+                if e.is_dir() and os.path.ismount(e.path):
+                    out[e.path] = None
+        except OSError:
+            pass
+        return out
+    out = {}
+    for path, fst in mounts.items():
+        if not path.startswith(VOLUMES_ROOT + "/"):
             continue
-        if t == 3 and letter + ":" == sys_drive:
+        if fst not in CARD_FSTYPES:
             continue
-        out[path] = t
+        if not os.path.isdir(path):
+            continue
+        out[path] = fst
     return out
 
 
@@ -57,14 +88,14 @@ def _has_entries(path):
 
 
 def wait_for_card(root):
-    """Show a 'plug in your card' dialog and wait until a card drive appears.
+    """Show a 'plug in your card' dialog and wait until a card volume appears.
 
-    Triggers when either a new card-type drive letter shows up, or a drive
-    that was present but empty starts containing files (card readers like
-    many CFexpress ones hold a permanent drive letter and only fill up when
-    a card is inserted). Returns the drive root path, or None if cancelled.
+    Triggers when either a new card volume shows up under /Volumes, or a
+    volume that was present but empty starts containing files (some readers
+    keep a permanent mount point and only fill up when a card is inserted).
+    Returns the volume root path, or None if cancelled.
     """
-    baseline = _candidate_drives()
+    baseline = _candidate_volumes()
     had_content = {p: _has_entries(p) for p in baseline}
     result = [None]
     cancelled = [False]
@@ -87,13 +118,13 @@ def wait_for_card(root):
     def poll():
         if cancelled[0]:
             return
-        now = _candidate_drives()
+        now = _candidate_volumes()
         found = []
         for p in sorted(now):
             if p not in baseline:
-                found.append(p)  # new drive letter
+                found.append(p)  # new card volume
             elif not had_content[p] and _has_entries(p):
-                found.append(p)  # permanent reader that just got a card
+                found.append(p)  # permanent mount point that just got a card
         if found:
             dialog.destroy()
             if len(found) == 1:
@@ -110,14 +141,12 @@ def wait_for_card(root):
 
 
 def _is_hidden(path):
-    """True for dotfiles or files/folders with the Windows Hidden attribute."""
+    """True for dotfiles or MacOS X resource forks / AppleDouble files."""
     if os.path.basename(path).startswith("."):
         return True
-    try:
-        attrs = os.stat(path).st_file_attributes
-    except (OSError, AttributeError):
-        return False
-    return bool(attrs & 0x2)  # FILE_ATTRIBUTE_HIDDEN
+    if os.path.basename(path).startswith("._"):
+        return True  # AppleDouble sidecar (e.g. ._IMG_1234.CR3)
+    return False
 
 
 def unique_dest(dest_dir, filename):
@@ -140,7 +169,7 @@ def pick_drive(root, drives):
     tk.Label(dialog, text="Multiple cards detected. Select one:").pack(pady=(10, 5))
     lb = tk.Listbox(dialog, height=min(len(drives), 8), width=40)
     for d in drives:
-        lb.insert(tk.END, d)
+        lb.insert(tk.END, Path(d).name or d)
     lb.selection_set(0)
     lb.pack(pady=5)
     result = [None]
@@ -157,13 +186,30 @@ def pick_drive(root, drives):
     return result[0]
 
 
+def _is_launchable(path):
+    """True for a Lightroom .app bundle or a directly executable file."""
+    p = Path(path)
+    if p.suffix == ".app" and p.is_dir():
+        return (p / "Contents" / "MacOS").is_dir()
+    return p.is_file() and os.access(p, os.X_OK)
+
+
+def _launch(path):
+    """Launch Lightroom: Finder opens .app bundles, plain binaries run directly."""
+    p = Path(path)
+    if p.suffix == ".app" and p.is_dir():
+        subprocess.Popen(["open", str(p)])
+    else:
+        subprocess.Popen([str(p)])
+
+
 def run_unload(root):
     config = load_config()
     if config is None:
         messagebox.showerror(
             "Card Unloader",
             "Configuration not found.\n\n"
-            "Open \u201cCard Unloader Settings\u201d to set up your folders first.",
+            "Open “Card Unloader Settings” to set up your folders first.",
             parent=root,
         )
         return
@@ -177,7 +223,7 @@ def run_unload(root):
         messagebox.showerror(
             "Card Unloader",
             "Primary destination is not set.\n\n"
-            "Open \u201cCard Unloader Settings\u201d to configure.",
+            "Open “Card Unloader Settings” to configure.",
             parent=root,
         )
         return
@@ -186,7 +232,7 @@ def run_unload(root):
         messagebox.showerror(
             "Card Unloader",
             f"Primary destination not found:\n{primary_dest}\n\n"
-            "Open \u201cCard Unloader Settings\u201d to fix this.",
+            "Open “Card Unloader Settings” to fix this.",
             parent=root,
         )
         return
@@ -195,11 +241,11 @@ def run_unload(root):
     card_path = wait_for_card(root)
     if card_path is None:
         return
-    card_path = card_path.rstrip("\\") + "\\"
+    card_root = Path(card_path)
 
     # --- Scan card for matching files (skip hidden files & folders) ---
     matched = []
-    for dirpath, dirs, files in os.walk(card_path):
+    for dirpath, dirs, files in os.walk(card_root):
         dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
         for fname in files:
             if _is_hidden(os.path.join(dirpath, fname)):
@@ -242,13 +288,13 @@ def run_unload(root):
                 shutil.copy2(f, dest)
 
     # --- Launch Lightroom? ---
-    if lightroom and os.path.isfile(lightroom):
+    if lightroom and _is_launchable(lightroom):
         if messagebox.askyesno("Card Unloader", "Launch Lightroom?", parent=root):
-            subprocess.Popen([lightroom])
+            _launch(lightroom)
 
     # --- Done ---
     messagebox.showinfo(
-        "Card Unloader", f"Done \u2014 {len(copied)} files processed.", parent=root
+        "Card Unloader", f"Done — {len(copied)} files processed.", parent=root
     )
 
 

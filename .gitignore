@@ -9,7 +9,7 @@ env/
 # PyInstaller (only produced if you use the optional EXE build)
 build/
 dist/
-Card Unloader.exe
+Card Unloader.app
 _internal/
 *.spec
 
