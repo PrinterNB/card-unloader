@@ -203,35 +203,29 @@ def _launch(path):
 class App:
     """Root window that shows the current stage + progress bar, and waits
     on button clicks. Nothing in here blocks outside buttons()/update loop."""
-    BAR_W = 240
+    BAR_CELLS = 34
 
     def __init__(self, root):
         self.root = root
         root.title("Card Unloader")
         root.attributes("-topmost", True)
-        self.text = tk.Label(root, justify="left", wraplength=420)
-        self.text.pack(padx=18, pady=(16, 8))
-        self.canvas = tk.Canvas(root, height=18, width=self.BAR_W + 16, border=0)
-        self.canvas.pack(padx=18, pady=(4, 14))
-        self._frac = None
+        self.text = tk.Label(root, justify="left")
+        self.text.pack(padx=18, pady=(18, 12))
 
     def stage(self, text, frac=None):
-        """Set status line; draw the bar when frac (0..1) given."""
-        self._frac = frac
+        """Set status line; when frac (0..1) is given, append a text bar.
+
+        The bar is text (▓ filled, ░ remaining) inside the label, not a
+        Canvas — it renders identically at any DPI/theme and can't be
+        clipped by window sizing.
+        """
+        if frac is not None:
+            done = min(self.BAR_CELLS, int(round(self.BAR_CELLS * max(0.0, frac))))
+            bar = "█" * done + "░" * (self.BAR_CELLS - done)
+            text = text + "\n\n" + bar
         self.text.configure(text=text)
-        self._redraw_bar()
         self.root.update_idletasks()
         logging.info("stage: %s", text.replace("\n", " | "))
-
-    def _redraw_bar(self):
-        c = self.canvas
-        c.delete("all")
-        if self._frac is None:
-            return
-        frac = min(max(self._frac, 0.0), 1.0)
-        x0, y0 = 8, 4
-        c.create_rectangle(x0, y0, x0 + self.BAR_W, y0 + 12, outline="#808080")
-        c.create_rectangle(x0, y0, x0 + int(self.BAR_W * frac), y0 + 12, fill="#4a90d9")
 
     def buttons(self, options):
         """Show buttons for {label: value}; block until one is clicked.
