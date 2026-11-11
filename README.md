@@ -36,7 +36,7 @@ Running the `.py` files needs Python installed. If you'd rather have a self-cont
 1. Open the settings window and click **Build Standalone App**.
 2. It offers to `pip install pyinstaller` the first time (one-time).
 3. It then asks **which folder** to put the app in (it creates `Card Unloader.app` inside; cancel and it lands next to `config_ui.py`). Nothing is ever written outside the project folder unless you pick a location.
-4. The result is a `Card Unloader.app` — a Finder-launchable bundle with your current settings baked in. Drag it anywhere and double-click it; the app unpacks itself to a temp folder on launch, so there's nothing else to keep beside it.
+4. The result is a `Card Unloader.app` — a Finder-launchable bundle that's **fully self-contained**: the Python runtime, Tk, and your current settings are all packed inside. You can delete everything else from the project folder and keep just the `.app` (it's one item to Finder); it will still run anywhere on that machine. Keep the folder only if you want to change settings or rebuild later.
 
 > To change settings after building, edit them in the settings window, click **Save**, then **Build Standalone App** again and save over the old bundle — the new one embeds the updated settings.
 

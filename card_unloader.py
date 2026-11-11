@@ -24,7 +24,24 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = BASE_DIR
 CONFIG_FILE = BASE_DIR / "config.json"
-LOG_FILE = SCRIPT_DIR / "card_unloader.log"
+
+
+def _log_file():
+    """Where the run log lives.
+
+    For the Finder-built app BASE_DIR is a temp folder recreated on each
+    launch, so write beside the .app bundle instead — the app can live
+    anywhere and its log can still be found next to it.
+    """
+    if getattr(sys, "frozen", False) and sys.argv:
+        exe = Path(os.path.realpath(sys.argv[0]))
+        bundle = exe.parent.parent  # .../Card Unloader.app/Contents/MacOS/exe
+        if bundle.suffix == ".app" and bundle.is_dir():
+            return bundle.parent / "card_unloader.log"
+    return SCRIPT_DIR / "card_unloader.log"
+
+
+LOG_FILE = _log_file()
 
 VOLUMES_ROOT = "/Volumes"
 # Camera cards are FAT32/exFAT (DCF spec). The Mac's own disks are apfs/hfs,
@@ -34,6 +51,9 @@ CARD_FSTYPES = {"msdos", "msdosx", "exfat", "vfat", "fat", "fat32", "ntfs", "ntf
 
 
 # ---------- config & filesystem helpers (no Tk involved) ----------
+
+_NO_CLICK = object()  # sentinel: "no button clicked yet" (None is a valid value)
+
 
 def load_config():
     if not CONFIG_FILE.exists():
@@ -219,7 +239,7 @@ class App:
         Returns the value of the clicked button. Button widgets are removed
         afterwards so the window reads cleanly at the next stage.
         """
-        self._choice = None
+        self._choice = _NO_CLICK
         made = []
         for label, value in options.items():
             def click(v=value):
@@ -227,7 +247,9 @@ class App:
             b = tk.Button(self.root, text=label, command=click)
             b.pack(pady=(0, 8))
             made.append(b)
-        while self._choice is None:
+        # None is a legitimate choice value (Continue/Quit), so wait on the
+        # sentinel, not on None — otherwise a click would never register.
+        while self._choice is _NO_CLICK:
             self.root.update()  # processes clicks; raises if the app is quit
         for b in made:
             b.destroy()
@@ -383,9 +405,11 @@ def run_unload(app):
     )
     app.buttons({"Continue": None})
 
-    # --- Copy to backup ---
+    # --- Copy to backup: always from the files just placed in primary, never
+    # re-read from the card — safe even if the card was already pulled out ---
     if backup_dest and os.path.isdir(backup_dest):
         if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
+            logging.info("backup source: %d files in primary_dest", len(copied))
             _, bfailed = app.copy_many(copied, backup_dest, "Copying to backup")
             failed.extend(bfailed)
         else:
@@ -412,11 +436,14 @@ def run_unload(app):
 
 
 def main():
-    logging.basicConfig(
-        filename=str(LOG_FILE),
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s: %(message)s",
-    )
+    try:
+        logging.basicConfig(
+            filename=str(LOG_FILE),
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s: %(message)s",
+        )
+    except OSError:
+        pass  # an unwritable log location must not break the run
     root = tk.Tk()
     app = App(root)
     try:
