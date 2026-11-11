@@ -27,12 +27,13 @@ DEFAULT_CONFIG = {
     "extensions": ["CR2", "CR3", "NEF", "RAF", "ARW", "DNG", "JPG", "JPEG"],
     "primary_destination": "",
     "backup_destination": "",
-    "lightroom_path": "",
+    "editor_path": "",
 }
 
-# Adobe installs its apps as "<name>.app" folders under a per-product folder
-# in /Applications, e.g. "Adobe Lightroom CC/Adobe Lightroom.app". Classic's
-# real bundle is preferred when several match.
+# Find auto-detects Adobe Lightroom only (Classic preferred when several
+# match; Adobe apps live in per-product folders, e.g. "Adobe Lightroom
+# CC/Adobe Lightroom.app"). Any other editing application is fine too —
+# pick it via Browse.
 LIGHTROOM_GLOBS = [
     "/Applications/Adobe Lightroom Classic*/*.app",
     "/Applications/Adobe Lightroom*/*.app",
@@ -57,7 +58,8 @@ def _is_app_bundle(p):
     return Path(p).suffix == ".app" and (Path(p) / "Contents" / "MacOS").is_dir()
 
 
-def find_lightroom():
+def find_editor():
+    """Auto-detects Adobe Lightroom (Browse covers any other editor)."""
     seen = []
     for pattern in LIGHTROOM_GLOBS:
         for p in sorted(glob.glob(pattern)):
@@ -184,16 +186,16 @@ class ConfigApp:
         ttk.Entry(bf, textvariable=self.bak_var).pack(side="left", fill="x", expand=True)
         ttk.Button(bf, text="Browse…", command=self._browse_backup, width=10).pack(side="left", padx=(6, 0))
 
-        # --- Lightroom path ---
-        ttk.Label(root, text="Lightroom app:").pack(
+        # --- Photo editor path ---
+        ttk.Label(root, text="Photo editor app (Lightroom, or other editing application):").pack(
             fill="x", padx=12, pady=(14, 0), anchor="w"
         )
         lf = ttk.Frame(root); lf.pack(fill="x", padx=12)
         self.lr_var = tk.StringVar()
-        self.lr_var.set(self.cfg.get("lightroom_path", ""))
+        self.lr_var.set(self.cfg.get("editor_path", ""))
         ttk.Entry(lf, textvariable=self.lr_var).pack(side="left", fill="x", expand=True)
         ttk.Button(lf, text="Browse…", command=self._browse_lr, width=10).pack(side="left", padx=(6, 0))
-        ttk.Button(lf, text="Find", command=self._find_lr, width=6).pack(side="left", padx=(2, 0))
+        ttk.Button(lf, text="Find", command=self._find_editor, width=6).pack(side="left", padx=(2, 0))
 
         # --- Action buttons ---
         btns = ttk.Frame(root); btns.pack(pady=20)
@@ -213,21 +215,21 @@ class ConfigApp:
             self.bak_var.set(p)
 
     def _browse_lr(self):
-        # .app is a folder on macOS; pick it directly (or drill into
-        # Contents/MacOS and pick the executable inside — both are supported).
-        p = filedialog.askdirectory(title="Select the Adobe Lightroom .app folder", parent=self.root)
+        # .app is a folder on macOS; pick any editor bundle directly.
+        p = filedialog.askdirectory(title="Select your photo editor .app folder", parent=self.root)
         if p:
             self.lr_var.set(p)
 
-    def _find_lr(self):
-        found = find_lightroom()
+    def _find_editor(self):
+        found = find_editor()
         if found:
             self.lr_var.set(found)
         else:
             messagebox.showinfo(
                 "Find Lightroom",
-                "Lightroom not found in /Applications.\n"
-                "Use Browse to locate it manually.",
+                "Adobe Lightroom not found in /Applications.\n"
+                "If you use another editing application, use Browse to point "
+                "at its .app folder.",
                 parent=self.root,
             )
 
@@ -241,7 +243,7 @@ class ConfigApp:
             "extensions": exts,
             "primary_destination": self.prim_var.get().strip(),
             "backup_destination": self.bak_var.get().strip(),
-            "lightroom_path": self.lr_var.get().strip(),
+            "editor_path": self.lr_var.get().strip(),
         }
 
     def _save(self):
@@ -261,13 +263,13 @@ class ConfigApp:
             warnings.append(f"Primary destination doesn't exist:\n{cfg['primary_destination']}")
         if cfg["backup_destination"] and not os.path.isdir(cfg["backup_destination"]):
             warnings.append(f"Backup destination doesn't exist:\n{cfg['backup_destination']}")
-        if cfg["lightroom_path"]:
-            p = Path(cfg["lightroom_path"])
-            ok = _is_app_bundle(cfg["lightroom_path"]) or (
+        if cfg["editor_path"]:
+            p = Path(cfg["editor_path"])
+            ok = _is_app_bundle(cfg["editor_path"]) or (
                 p.is_file() and os.access(p, os.X_OK)
             )
             if not ok:
-                warnings.append(f"Lightroom not found:\n{cfg['lightroom_path']}")
+                warnings.append(f"Photo editor not found:\n{cfg['editor_path']}")
 
         if warnings:
             messagebox.showwarning(

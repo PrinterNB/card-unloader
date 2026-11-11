@@ -2,7 +2,8 @@
 
 One visible window walks the user through every stage — waiting for the card,
 scanning, copying to the primary folder, removing the card, backup copy,
-Lightroom — with a live status line and progress bar. All prompts are buttons
+photo editor — with a live status line, progress bar, and per-phase
+estimates (x of y, ~m:ss left, MB/s). All prompts are buttons
 in this one window (no blocking message dialogs, no hidden root windows).
 Every run is logged to card_unloader.log next to the app, since a Finder-
 launched app has no stdout.
@@ -188,7 +189,7 @@ def _is_launchable(path):
 
 
 def _launch(path):
-    """Launch Lightroom: Finder opens .app bundles, plain binaries run directly."""
+    """Launch the photo editor: Finder opens .app bundles, plain binaries run directly."""
     bundle = _app_wrapper(path)
     if bundle:
         subprocess.run(["open", str(bundle)])
@@ -321,7 +322,7 @@ def run_unload(app, quit):
                       "(Logged — check card_unloader.log beside the app.)")
             app.show_buttons({"Quit": quit})
 
-    def finish(copied, failed):
+    def finish(copied, failed, note=""):
         done_text = f"Done — {len(copied)} files processed."
         if failed:
             done_text += (
@@ -329,24 +330,26 @@ def run_unload(app, quit):
                 "(destination permission or disk issue):\n"
                 + "\n".join(f"• {name}" for name in failed[:8])
             )
+        if note:
+            done_text += f"\n\n{note}"
         app.stage(done_text)
         logging.info("session complete: copied=%d failed=%d", len(copied), len(failed))
         app.show_buttons({"Quit": quit})
 
-    def after_backup(copied, failed):
-        if lightroom and _is_launchable(lightroom):
-            app.stage(f"Copies done. Launch Lightroom?\n\n{lightroom}")
+    def after_backup(copied, failed, note=""):
+        if editor and _is_launchable(editor):
+            app.stage(f"Copies done. Launch {editor_name}?\n\n{editor}")
             app.show_buttons({
-                "Yes": lambda: safe(lambda: launch_then_finish(copied, failed)),
-                "No": lambda: safe(lambda: finish(copied, failed)),
+                "Yes": lambda: safe(lambda: launch_then_finish(copied, failed, note)),
+                "No": lambda: safe(lambda: finish(copied, failed, note)),
             })
             return
-        finish(copied, failed)
+        finish(copied, failed, note)
 
-    def launch_then_finish(copied, failed):
-        app.stage("Launching Lightroom…")
-        _launch(lightroom)
-        finish(copied, failed)
+    def launch_then_finish(copied, failed, note=""):
+        app.stage(f"Launching {editor_name}…")
+        _launch(editor)
+        finish(copied, failed, note)
 
     def run_backup(copied, failed):
         if backup_dest and os.path.isdir(backup_dest):
@@ -355,8 +358,12 @@ def run_unload(app, quit):
                 copy_async(app, copied, backup_dest, "Copying to backup",
                            lambda c2, f2: after_backup(copied, failed + f2))
                 return
-            logging.info("backup same as primary; skipped")
-        after_backup(copied, failed)
+            note = "Backup folder is the same as primary (no duplicates made)"
+        elif backup_dest:
+            note = f"Backup folder not found: {backup_dest} (skipped)"
+        else:
+            note = "No backup folder set (add one in Settings for mirrored copies)"
+        after_backup(copied, failed, note)
 
     def on_primary_done(copied, failed):
         if not copied:
@@ -410,9 +417,10 @@ def run_unload(app, quit):
     extensions = {e.upper().lstrip(".") for e in cfg.get("extensions", [])}
     primary_dest = cfg.get("primary_destination", "").strip()
     backup_dest = cfg.get("backup_destination", "").strip()
-    lightroom = cfg.get("lightroom_path", "").strip()
-    logging.info("config: exts=%s primary=%r backup=%r lr=%r",
-                 sorted(extensions), primary_dest, backup_dest, lightroom)
+    editor = cfg.get("editor_path", "").strip()
+    editor_name = Path(editor).name.removesuffix(".app") if editor else ""
+    logging.info("config: exts=%s primary=%r backup=%r editor=%r",
+                 sorted(extensions), primary_dest, backup_dest, editor)
     if not primary_dest:
         app.stage("Primary destination is not set.\n\n"
                   "Open “Card Unloader Settings” to configure.")
