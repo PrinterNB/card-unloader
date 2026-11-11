@@ -1,5 +1,7 @@
 # Card Unloader
 
+> **macOS:** a macOS port lives on the [`macos-port` branch](https://github.com/PrinterNB/card-unloader/tree/macos-port) — same features, `.app` bundle build, `/Volumes` card detection. See its [README](https://github.com/PrinterNB/card-unloader/blob/macos-port/README.md).
+
 One-click SD card photo unloader for Windows.
 
 ## Setup (one time)
