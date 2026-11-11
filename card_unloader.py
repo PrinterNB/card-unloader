@@ -35,7 +35,8 @@ def _mounted_volumes():
     """Return {mount_point: fstype} for everything mounted, via /sbin/mount.
 
     Each line looks like:  msdos on /Volumes/UNTITLED (msdos, local, nodev, …)
-    Mount points can contain spaces; device/fstype names never do.
+    Device and mount-point names can contain spaces (e.g. SMB shares), so the
+    fields are matched lazily up to " on " and the "(flags)" tail.
     Returns None if /sbin/mount couldn't be read.
     """
     try:
@@ -44,7 +45,7 @@ def _mounted_volumes():
         return None
     out = {}
     for line in r.stdout.splitlines():
-        m = re.match(r"^(\S+) on (.+) \(([^()]+)\)\s*$", line)
+        m = re.match(r"^(.+?) on (.+?) \(([^()]+)\)\s*$", line)
         if m:
             out[m.group(2)] = m.group(3).split(",")[0]
     return out
@@ -186,21 +187,38 @@ def pick_drive(root, drives):
     return result[0]
 
 
+def _app_wrapper(path):
+    """Return the .app bundle at or above path, or None.
+
+    Users can browse straight into Contents/MacOS — Adobe apps must not be
+    exec'd from there (nested helper bundles live beside the main exe), so
+    any path inside a bundle is normalized up to the bundle itself and
+    launched via Finder.
+    """
+    parts = Path(path).parts
+    for i, part in enumerate(parts):
+        if part.endswith(".app"):
+            bundle = Path(*parts[: i + 1])
+            if bundle.is_dir():
+                return bundle
+    return None
+
+
 def _is_launchable(path):
-    """True for a Lightroom .app bundle or a directly executable file."""
+    """True for a Lightroom .app bundle, a path inside one, or an executable."""
+    if _app_wrapper(path):
+        return True
     p = Path(path)
-    if p.suffix == ".app" and p.is_dir():
-        return (p / "Contents" / "MacOS").is_dir()
     return p.is_file() and os.access(p, os.X_OK)
 
 
 def _launch(path):
     """Launch Lightroom: Finder opens .app bundles, plain binaries run directly."""
-    p = Path(path)
-    if p.suffix == ".app" and p.is_dir():
-        subprocess.Popen(["open", str(p)])
+    bundle = _app_wrapper(path)
+    if bundle:
+        subprocess.run(["open", str(bundle)])
     else:
-        subprocess.Popen([str(p)])
+        subprocess.Popen([str(path)])
 
 
 def run_unload(root):

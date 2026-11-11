@@ -75,11 +75,11 @@ def find_lightroom():
 def build_app(save_dir):
     """Build a standalone 'Card Unloader.app' bundle and save it under save_dir.
 
-    --onefile mode: everything (the app, its libraries, config.json) is
-    packed into one binary, which is then placed in a minimal .app bundle
-    (Contents/MacOS/<name>) so Finder can double-click it. PyInstaller builds
-    into dist/, the bundle is assembled there, and the bundle is copied to
-    save_dir/Card Unloader.app wherever the user chose.
+    --onefile + --windowed: everything (the app, its libraries, config.json)
+    is packed into one binary, and PyInstaller itself assembles a Finder-
+    launchable Card Unloader.app bundle (with a minimal Info.plist) in dist/.
+    The bundle is copied to save_dir/Card Unloader.app wherever the user
+    chose; if PyInstaller only produced the bare binary, we wrap it.
     Returns (True, bundle_path) on success, (False, error_text) on failure.
     """
     save_dir = Path(save_dir)
@@ -87,6 +87,7 @@ def build_app(save_dir):
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
+        "--windowed",
         "--name", ENTRY_NAME,
         # Absolute path — PyInstaller resolves relative --add-data against the
         # .spec directory, which we put in build/, not the project root.
@@ -99,19 +100,23 @@ def build_app(save_dir):
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SCRIPT_DIR))
     if r.returncode != 0:
         return False, r.stderr.strip()[-2000:] or f"PyInstaller exit code {r.returncode}"
-    built = SCRIPT_DIR / "dist" / ENTRY_NAME  # the bare onefile binary
-    if not built.is_file():
-        return False, f"Build reported success but {built} was not produced."
-
-    # Assemble a Finder-launchable bundle: Card Unloader.app/Contents/MacOS/Card Unloader
+    # With --windowed PyInstaller assembles the Finder-launchable bundle itself
+    # (dist/Card Unloader.app with a minimal Info.plist). If the bundle isn't
+    # there but the bare binary is, wrap it ourselves — same layout, Finder
+    # launches both (executable basename must equal the folder minus .app).
+    built = SCRIPT_DIR / "dist" / ENTRY_NAME
     bundle = SCRIPT_DIR / "dist" / APP_NAME
-    macos_dir = bundle / "Contents" / "MacOS"
-    try:
-        macos_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(built), str(macos_dir / ENTRY_NAME))
-        (macos_dir / ENTRY_NAME).chmod(0o755)
-    except OSError as e:
-        return False, f"Built the binary but couldn't assemble the bundle: {e}"
+    entry = bundle / "Contents" / "MacOS" / ENTRY_NAME
+    if not entry.is_file():
+        if not built.is_file():
+            return False, f"Build reported success but {built} was not produced."
+        try:
+            macos_dir = bundle / "Contents" / "MacOS"
+            macos_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(built), str(entry))
+            entry.chmod(0o755)
+        except OSError as e:
+            return False, f"Built the binary but couldn't assemble the bundle: {e}"
 
     # Copy the bundle to the chosen folder, replacing anything already there.
     target = save_dir / APP_NAME
