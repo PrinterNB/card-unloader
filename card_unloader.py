@@ -10,6 +10,7 @@ launched app has no stdout.
 import json
 import logging
 import os
+import time
 import re
 import shutil
 import subprocess
@@ -246,15 +247,25 @@ class App:
 
 # ---------- the flow ----------
 
+def _eta(t0, done, total):
+    """Remaining-time estimate "m:ss" from the pace so far, or '' if exact end."""
+    if done >= total:
+        return ""
+    avg = (time.monotonic() - t0) / max(done, 1)
+    eta = avg * (total - done)
+    return f"≈{int(eta // 60)}:{int(eta % 60):02d} left"
+
+
 def copy_async(app, files, dest_dir, label, on_done):
     """Copy one file per after() callback so Tk's mainloop repaints between
     files — the progress bar visibly advances instead of beachballing.
-    on_done(copied, failed) is called via the chain after the last file."""
+    Also shows a minutes:seconds estimate of what's left in this phase."""
     root = app.root
     dest = Path(dest_dir)
     total = max(len(files), 1)
     copied, failed = [], []
-    app.stage(f"{label} — 0 of {total}", 0.0)
+    t0 = time.monotonic()
+    app.stage(f"{label} — 0 of {total} — estimating…", 0.0)
 
     def step(i):
         if i < len(files):
@@ -264,7 +275,12 @@ def copy_async(app, files, dest_dir, label, on_done):
                 copied.append(d)
             else:
                 failed.append(Path(f).name)
-            app.stage(f"{label} — {i + 1} of {total}", (i + 1) / total)
+            done = i + 1
+            eta = _eta(t0, done, total)
+            line = f"{label} — {done} of {total}"
+            if eta:
+                line += f" — {eta}"
+            app.stage(line, done / total)
             root.after(25, lambda: step(i + 1))
         else:
             on_done(copied, failed)
