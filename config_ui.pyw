@@ -23,9 +23,12 @@ DEFAULT_CONFIG = {
     "extensions": ["CR2", "CR3", "NEF", "RAF", "ARW", "DNG", "JPG", "JPEG"],
     "primary_destination": "",
     "backup_destination": "",
-    "lightroom_path": r"C:\Program Files\Adobe\Adobe Lightroom CC\lightroom.exe",
+    "editor_path": r"C:\Program Files\Adobe\Adobe Lightroom CC\lightroom.exe",
 }
 
+# Find auto-detects Adobe Lightroom ONLY (the common Windows install paths).
+# Any other editing application (Photoshop, Elements, Bridge…) is fine too —
+# pick its .exe via Browse.
 LIGHTROOM_LOCATIONS = [
     r"C:\Program Files\Adobe\Adobe Lightroom CC\lightroom.exe",
     r"C:\Program Files\Adobe\Adobe Lightroom Classic\Lightroom.exe",
@@ -49,6 +52,7 @@ def save_config(cfg):
 
 
 def find_lightroom():
+    """Auto-detect Adobe Lightroom only — Browse covers other editors."""
     for p in LIGHTROOM_LOCATIONS:
         if os.path.isfile(p):
             return p
@@ -151,16 +155,16 @@ class ConfigApp:
         ttk.Entry(bf, textvariable=self.bak_var).pack(side="left", fill="x", expand=True)
         ttk.Button(bf, text="Browse\u2026", command=self._browse_backup, width=10).pack(side="left", padx=(6, 0))
 
-        # --- Lightroom path ---
-        ttk.Label(root, text="Lightroom executable:").pack(
+        # --- Photo editor path ---
+        ttk.Label(root, text="Photo editor app (Lightroom, or other editing application):").pack(
             fill="x", padx=12, pady=(14, 0), anchor="w"
         )
         lf = ttk.Frame(root); lf.pack(fill="x", padx=12)
         self.lr_var = tk.StringVar()
-        self.lr_var.set(self.cfg.get("lightroom_path", ""))
+        self.lr_var.set(self.cfg.get("editor_path", ""))
         ttk.Entry(lf, textvariable=self.lr_var).pack(side="left", fill="x", expand=True)
         ttk.Button(lf, text="Browse\u2026", command=self._browse_lr, width=10).pack(side="left", padx=(6, 0))
-        ttk.Button(lf, text="Find", command=self._find_lr, width=6).pack(side="left", padx=(2, 0))
+        ttk.Button(lf, text="Find", command=self._find_editor, width=6).pack(side="left", padx=(2, 0))
 
         # --- Action buttons ---
         btns = ttk.Frame(root); btns.pack(pady=20)
@@ -181,21 +185,22 @@ class ConfigApp:
 
     def _browse_lr(self):
         p = filedialog.askopenfilename(
-            title="Select Lightroom.exe", parent=self.root,
+            title="Select your photo editor .exe", parent=self.root,
             filetypes=[("Executables", "*.exe")],
         )
         if p:
             self.lr_var.set(p)
 
-    def _find_lr(self):
+    def _find_editor(self):
         found = find_lightroom()
         if found:
             self.lr_var.set(found)
         else:
             messagebox.showinfo(
                 "Find Lightroom",
-                "Lightroom not found in common locations.\n"
-                "Use Browse to locate it manually.",
+                "Adobe Lightroom not found in common locations.\n"
+                "If you use another editing application, use Browse to point "
+                "at its .exe.",
                 parent=self.root,
             )
 
@@ -209,7 +214,7 @@ class ConfigApp:
             "extensions": exts,
             "primary_destination": self.prim_var.get().strip(),
             "backup_destination": self.bak_var.get().strip(),
-            "lightroom_path": self.lr_var.get().strip(),
+            "editor_path": self.lr_var.get().strip(),
         }
 
     def _save(self):
@@ -229,8 +234,8 @@ class ConfigApp:
             warnings.append(f"Primary destination doesn't exist:\n{cfg['primary_destination']}")
         if cfg["backup_destination"] and not os.path.isdir(cfg["backup_destination"]):
             warnings.append(f"Backup destination doesn't exist:\n{cfg['backup_destination']}")
-        if cfg["lightroom_path"] and not os.path.isfile(cfg["lightroom_path"]):
-            warnings.append(f"Lightroom not found:\n{cfg['lightroom_path']}")
+        if cfg["editor_path"] and not os.path.isfile(cfg["editor_path"]):
+            warnings.append(f"Photo editor not found:\n{cfg['editor_path']}")
 
         if warnings:
             messagebox.showwarning(
@@ -298,7 +303,9 @@ class ConfigApp:
             messagebox.showinfo(
                 "Build Standalone EXE",
                 f"Done.\n\nStandalone app:\n{info}\n\n"
-                "It's a single file \u2014 copy it anywhere you like.",
+                "It's fully self-contained \u2014 the Python runtime, Tk and your "
+                "current settings are all packed inside this one file. Copy it "
+                "anywhere you like and double-click it.",
                 parent=self.root,
             )
         else:
