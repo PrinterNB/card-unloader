@@ -256,6 +256,16 @@ def _eta(t0, done, total):
     return f"≈{int(eta // 60)}:{int(eta % 60):02d} left"
 
 
+def _rate(nbytes, secs):
+    """Throughput of the current phase, e.g. "23.4 MB/s" or "512 KB/s"."""
+    if secs <= 0:
+        return ""
+    kb = nbytes / secs / 1024
+    if kb >= 1024:
+        return f"{kb / 1024:.1f} MB/s"
+    return f"{kb:.0f} KB/s"
+
+
 def copy_async(app, files, dest_dir, label, on_done):
     """Copy one file per after() callback so Tk's mainloop repaints between
     files — the progress bar visibly advances instead of beachballing.
@@ -264,22 +274,30 @@ def copy_async(app, files, dest_dir, label, on_done):
     dest = Path(dest_dir)
     total = max(len(files), 1)
     copied, failed = [], []
+    nbytes = [0]
     t0 = time.monotonic()
     app.stage(f"{label} — 0 of {total} — estimating…", 0.0)
 
     def step(i):
         if i < len(files):
             f = files[i]
+            try:
+                nbytes[0] += Path(f).stat().st_size
+            except OSError:
+                pass
             d = unique_dest(dest, Path(f).name)
             if _copy_file(f, d):
                 copied.append(d)
             else:
                 failed.append(Path(f).name)
             done = i + 1
-            eta = _eta(t0, done, total)
             line = f"{label} — {done} of {total}"
+            eta = _eta(t0, done, total)
             if eta:
                 line += f" — {eta}"
+            rate = _rate(nbytes[0], time.monotonic() - t0)
+            if rate:
+                line += f" — {rate}"
             app.stage(line, done / total)
             root.after(25, lambda: step(i + 1))
         else:
