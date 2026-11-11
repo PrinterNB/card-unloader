@@ -52,9 +52,6 @@ CARD_FSTYPES = {"msdos", "msdosx", "exfat", "vfat", "fat", "fat32", "ntfs", "ntf
 
 # ---------- config & filesystem helpers (no Tk involved) ----------
 
-_NO_CLICK = object()  # sentinel: "no button clicked yet" (None is a valid value)
-
-
 def load_config():
     if not CONFIG_FILE.exists():
         return None
@@ -201,8 +198,9 @@ def _launch(path):
 # ---------- the one-window UI ----------
 
 class App:
-    """Root window that shows the current stage + progress bar, and waits
-    on button clicks. Nothing in here blocks outside buttons()/update loop."""
+    """Root window UI. Entirely event-driven: dialogs show buttons and the
+    flow continues from click callbacks, so Tk's mainloop (and its repaints)
+    stay in charge at all times — heavy work must never run between clicks."""
     BAR_CELLS = 34
 
     def __init__(self, root):
@@ -211,6 +209,7 @@ class App:
         root.attributes("-topmost", True)
         self.text = tk.Label(root, justify="left")
         self.text.pack(padx=18, pady=(18, 12))
+        self._buttons = []
 
     def stage(self, text, frac=None):
         """Set status line; when frac (0..1) is given, append a text bar.
@@ -227,206 +226,198 @@ class App:
         self.root.update_idletasks()
         logging.info("stage: %s", text.replace("\n", " | "))
 
-    def buttons(self, options):
-        """Show buttons for {label: value}; block until one is clicked.
-
-        Returns the value of the clicked button. Button widgets are removed
-        afterwards so the window reads cleanly at the next stage.
-        """
-        self._choice = _NO_CLICK
-        made = []
-        for label, value in options.items():
-            def click(v=value):
-                self._choice = v
-            b = tk.Button(self.root, text=label, command=click)
+    def show_buttons(self, options):
+        """Show buttons for {label: callback}; a click runs that callback
+        inside Tk's event loop (safe to open more dialogs or schedule more
+        after() work from it). Shown buttons are removed on click."""
+        for label, fn in options.items():
+            def clickify(f=fn):
+                self._clear_buttons()
+                f()
+            b = tk.Button(self.root, text=label, command=clickify)
             b.pack(pady=(0, 8))
-            made.append(b)
-        # None is a legitimate choice value (Continue/Quit), so wait on the
-        # sentinel, not on None — otherwise a click would never register.
-        while self._choice is _NO_CLICK:
-            self.root.update()  # processes clicks; raises if the app is quit
-        for b in made:
+            self._buttons.append(b)
+
+    def _clear_buttons(self):
+        for b in self._buttons:
             b.destroy()
-        return self._choice
-
-    def wait_for_volume(self):
-        """Detect the camera card. Returns its volume root, or None if cancelled.
-
-        Already-mounted cards are detected immediately (only when they look
-        like camera cards — DCIM); otherwise poll until a new card-formatted
-        volume mounts, or a present-but-empty one fills up.
-        """
-        baseline = _candidate_volumes()
-        had = {p: _has_entries(p) for p in baseline}
-        already = [p for p in sorted(baseline) if had[p] and _has_dcim(p)]
-        if already:
-            logging.info("card already mounted at launch: %s", already)
-            return already[0] if len(already) == 1 else self.pick_volume(already)
-
-        self.stage("Waiting for your camera card…\n\nPlug it in now.")
-        self._done = False
-        cancel = tk.Button(self.root, text="Cancel",
-                           command=lambda: setattr(self, "_done", True))
-        cancel.pack(pady=(0, 8))
-        self._card = None
-
-        def poll():
-            if self._done:
-                return
-            now = _candidate_volumes()
-            found = []
-            for p in sorted(now):
-                if p not in baseline:
-                    found.append(p)  # new card volume mounted
-                elif not had[p] and _has_entries(p):
-                    found.append(p)  # permanent mount point just got a card
-            if found:
-                logging.info("card volumes detected: %s", found)
-                self._card = found[0] if len(found) == 1 else self.pick_volume(found)
-                self._done = True
-                return
-            self.root.after(500, poll)
-
-        poll()
-        while not self._done:
-            self.root.update()
-        cancel.destroy()
-        return self._card
-
-    def pick_volume(self, volumes):
-        """Multiple cards mounted: show one button per volume, return choice."""
-        self.stage(
-            "Multiple cards detected.\n\nClick the one you want to unload:"
-        )
-        options = {Path(v).name: v for v in volumes}
-        if len(options) < len(volumes):  # name collision: fall back to full path
-            options = {v: v for v in volumes}
-        return self.buttons(options)
-
-    def copy_many(self, files, dest_dir, stage_label):
-        """Copy each file to dest_dir (unique names), live progress bar.
-
-        Returns (copied_paths, [failed file names]).
-        """
-        dest_dir = Path(dest_dir)
-        total = max(len(files), 1)
-        copied, failed = [], []
-        for i, f in enumerate(files, 1):
-            dest = unique_dest(dest_dir, Path(f).name)
-            if _copy_file(f, dest):
-                copied.append(dest)
-            else:
-                failed.append(Path(f).name)
-            self.stage(f"{stage_label} — {i} of {total}", i / total)
-        return copied, failed
+        self._buttons = []
 
 
 # ---------- the flow ----------
 
-def run_unload(app):
+def copy_async(app, files, dest_dir, label, on_done):
+    """Copy one file per after() callback so Tk's mainloop repaints between
+    files — the progress bar visibly advances instead of beachballing.
+    on_done(copied, failed) is called via the chain after the last file."""
+    root = app.root
+    dest = Path(dest_dir)
+    total = max(len(files), 1)
+    copied, failed = [], []
+    app.stage(f"{label} — 0 of {total}", 0.0)
+
+    def step(i):
+        if i < len(files):
+            f = files[i]
+            d = unique_dest(dest, Path(f).name)
+            if _copy_file(f, d):
+                copied.append(d)
+            else:
+                failed.append(Path(f).name)
+            app.stage(f"{label} — {i + 1} of {total}", (i + 1) / total)
+            root.after(25, lambda: step(i + 1))
+        else:
+            on_done(copied, failed)
+
+    root.after(25, lambda: step(0))
+
+
+def run_unload(app, quit):
+    """Start the flow; everything past this point is callback/after driven
+    so Tk's mainloop stays alive and repaints during heavy work."""
+    root = app.root
+
+    def safe(fn):
+        """Run fn with a top-level trap: a crash becomes a visible screen + log."""
+        try:
+            fn()
+        except Exception as e:
+            logging.exception("flow crashed")
+            app.stage(f"Something went wrong:\n\n{e}\n\n"
+                      "(Logged — check card_unloader.log beside the app.)")
+            app.show_buttons({"Quit": quit})
+
+    def finish(copied, failed):
+        done_text = f"Done — {len(copied)} files processed."
+        if failed:
+            done_text += (
+                f"\n\n{len(failed)} files could not be copied "
+                "(destination permission or disk issue):\n"
+                + "\n".join(f"• {name}" for name in failed[:8])
+            )
+        app.stage(done_text)
+        logging.info("session complete: copied=%d failed=%d", len(copied), len(failed))
+        app.show_buttons({"Quit": quit})
+
+    def after_backup(copied, failed):
+        if lightroom and _is_launchable(lightroom):
+            app.stage(f"Copies done. Launch Lightroom?\n\n{lightroom}")
+            app.show_buttons({
+                "Yes": lambda: safe(lambda: launch_then_finish(copied, failed)),
+                "No": lambda: safe(lambda: finish(copied, failed)),
+            })
+            return
+        finish(copied, failed)
+
+    def launch_then_finish(copied, failed):
+        app.stage("Launching Lightroom…")
+        _launch(lightroom)
+        finish(copied, failed)
+
+    def run_backup(copied, failed):
+        if backup_dest and os.path.isdir(backup_dest):
+            if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
+                logging.info("backup source: %d files in primary_dest (card not needed)", len(copied))
+                copy_async(app, copied, backup_dest, "Copying to backup",
+                           lambda c2, f2: after_backup(copied, failed + f2))
+                return
+            logging.info("backup same as primary; skipped")
+        after_backup(copied, failed)
+
+    def on_primary_done(copied, failed):
+        if not copied:
+            app.stage(f"Could not copy any files to:\n{primary_dest}\n\n"
+                      "Check the folder exists and is writable.")
+            app.show_buttons({"Quit": quit})
+            return
+        app.stage(f"{len(copied)} files copied to:\n{primary_dest}\n\n"
+                  "You can safely remove the card.")
+        app.show_buttons({"Continue": lambda: safe(lambda: run_backup(copied, failed))})
+
+    def on_card(card_path):
+        def do_scan():
+            app.stage(f"Card detected: {Path(card_path).name}\n\nScanning your card…")
+            matched = []
+            for dirpath, dirs, files in os.walk(card_path):
+                dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
+                for fname in files:
+                    if _is_hidden(os.path.join(dirpath, fname)):
+                        continue
+                    ext = os.path.splitext(fname)[1].upper().lstrip(".")
+                    if ext in extensions:
+                        matched.append(Path(dirpath) / fname)
+            if not matched:
+                ext_list = ", ".join(f".{e}" for e in sorted(extensions))
+                app.stage(f"No matching files found on card.\n\nLooked for: {ext_list}")
+                app.show_buttons({"Quit": quit})
+                return
+            logging.info("matched %d files on %s", len(matched), Path(card_path))
+            copy_async(app, matched, primary_dest, "Copying to primary", on_primary_done)
+        root.after(5, lambda: safe(do_scan))
+
+    def handle_found(found):
+        app._clear_buttons()  # drop the Cancel button
+        if len(found) == 1:
+            on_card(found[0])
+            return
+        app.stage("Multiple cards detected.\n\nClick the one you want to unload:")
+        opts = {Path(v).name: (lambda p=v: safe(lambda: on_card(p))) for v in found}
+        if len(opts) < len(found):  # name collision: show full paths
+            opts = {v: (lambda p=v: safe(lambda: on_card(p))) for v in found}
+        app.show_buttons(opts)
+
+    # --- config & validation (fast, safe to run synchronously) ---
     cfg = load_config()
     if cfg is None:
-        app.stage(
-            "Configuration not found.\n\n"
-            "Open “Card Unloader Settings” to set up your folders first."
-        )
-        app.buttons({"Quit": None})
+        app.stage("Configuration not found.\n\n"
+                  "Open “Card Unloader Settings” to set up your folders first.")
+        app.show_buttons({"Quit": quit})
         return
-
     extensions = {e.upper().lstrip(".") for e in cfg.get("extensions", [])}
     primary_dest = cfg.get("primary_destination", "").strip()
     backup_dest = cfg.get("backup_destination", "").strip()
     lightroom = cfg.get("lightroom_path", "").strip()
     logging.info("config: exts=%s primary=%r backup=%r lr=%r",
                  sorted(extensions), primary_dest, backup_dest, lightroom)
-
     if not primary_dest:
-        app.stage(
-            "Primary destination is not set.\n\n"
-            "Open “Card Unloader Settings” to configure."
-        )
-        app.buttons({"Quit": None})
+        app.stage("Primary destination is not set.\n\n"
+                  "Open “Card Unloader Settings” to configure.")
+        app.show_buttons({"Quit": quit})
         return
-
     if not os.path.isdir(primary_dest):
-        app.stage(
-            f"Primary destination not found:\n{primary_dest}\n\n"
-            "Open “Card Unloader Settings” to fix this."
-        )
-        app.buttons({"Quit": None})
+        app.stage(f"Primary destination not found:\n{primary_dest}\n\n"
+                  "Open “Card Unloader Settings” to fix this.")
+        app.show_buttons({"Quit": quit})
         return
 
-    # --- Wait for camera card ---
-    card_path = app.wait_for_volume()
-    if card_path is None:
-        app.stage("Cancelled — nothing was copied.")
+    # --- Wait for camera card (polling runs as after() callbacks) ---
+    baseline = _candidate_volumes()
+    had = {p: _has_entries(p) for p in baseline}
+    logging.info("candidate volumes at launch: %s", sorted(baseline))
+    already = [p for p in sorted(baseline) if had[p] and _has_dcim(p)]
+    if already:
+        logging.info("card already mounted at launch: %s", already)
+        handle_found(already)
         return
-    card_root = Path(card_path)
-    app.stage(f"Card detected: {Path(card_path).name}\n\nScanning your card…")
+    app.stage("Waiting for your camera card…\n\nPlug it in now.")
+    app.show_buttons({"Cancel": lambda: (app.stage("Cancelled — nothing was copied."),
+                                              app.show_buttons({"Quit": quit}))})
 
-    # --- Scan card for matching files (skip hidden files & folders) ---
-    matched = []
-    for dirpath, dirs, files in os.walk(card_root):
-        dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
-        for fname in files:
-            if _is_hidden(os.path.join(dirpath, fname)):
-                continue
-            ext = os.path.splitext(fname)[1].upper().lstrip(".")
-            if ext in extensions:
-                matched.append(Path(dirpath) / fname)
+    def poll():
+        now = _candidate_volumes()
+        found = []
+        for p in sorted(now):
+            if p not in baseline:
+                found.append(p)  # new card volume mounted
+            elif not had[p] and _has_entries(p):
+                found.append(p)  # permanent mount point just got a card
+        if found:
+            logging.info("card volumes detected: %s", found)
+            handle_found(found)
+            return
+        root.after(500, poll)
 
-    if not matched:
-        ext_list = ", ".join(f".{e}" for e in sorted(extensions))
-        app.stage(f"No matching files found on card.\n\nLooked for: {ext_list}")
-        app.buttons({"Quit": None})
-        return
-    logging.info("matched %d files on %s", len(matched), card_root)
-
-    # --- Copy to primary destination ---
-    copied, failed = app.copy_many(matched, primary_dest, "Copying to primary")
-    if not copied:
-        app.stage(
-            f"Could not copy any files to:\n{primary_dest}\n\n"
-            "Check the folder exists and is writable."
-        )
-        app.buttons({"Quit": None})
-        return
-
-    # --- Card can be removed ---
-    app.stage(
-        f"{len(copied)} files copied to:\n{primary_dest}\n\n"
-        "You can safely remove the card."
-    )
-    app.buttons({"Continue": None})
-
-    # --- Copy to backup: always from the files just placed in primary, never
-    # re-read from the card — safe even if the card was already pulled out ---
-    if backup_dest and os.path.isdir(backup_dest):
-        if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
-            logging.info("backup source: %d files in primary_dest", len(copied))
-            _, bfailed = app.copy_many(copied, backup_dest, "Copying to backup")
-            failed.extend(bfailed)
-        else:
-            logging.info("backup same as primary; skipped")
-
-    # --- Launch Lightroom? ---
-    if lightroom and _is_launchable(lightroom):
-        app.stage(f"Copies done. Launch Lightroom?\n\n{lightroom}")
-        if app.buttons({"Yes": True, "No": False}):
-            app.stage("Launching Lightroom…")
-            _launch(lightroom)
-
-    # --- Done ---
-    done_text = f"Done — {len(copied)} files processed."
-    if failed:
-        done_text += (
-            f"\n\n{len(failed)} files could not be copied "
-            "(destination permission or disk issue):\n"
-            + "\n".join(f"• {name}" for name in failed[:8])
-        )
-    app.stage(done_text)
-    logging.info("session complete: copied=%d failed=%d", len(copied), len(failed))
-    app.buttons({"Quit": None})
+    root.after(500, poll)
 
 
 def main():
@@ -440,15 +431,26 @@ def main():
         pass  # an unwritable log location must not break the run
     root = tk.Tk()
     app = App(root)
-    try:
-        run_unload(app)
-    except Exception as e:  # last-resort: log + show, never die silently
-        logging.exception("session crashed")
-        app.stage(f"Something went wrong:\n\n{e}\n\n(The error was logged.)")
+
+    def quit():
         try:
-            app.buttons({"Quit": None})
+            root.quit()
         except Exception:
             pass
+
+    def kickoff():
+        try:
+            run_unload(app, quit)
+        except Exception as e:
+            logging.exception("startup crashed")
+            app.stage(f"Something went wrong:\n\n{e}")
+            app.show_buttons({"Quit": quit})
+
+    root.after(5, kickoff)
+    try:
+        root.mainloop()
+    except Exception:
+        logging.info("app quit (Cmd+Q or Tcl exit)")
     finally:
         try:
             root.destroy()
