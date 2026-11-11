@@ -44,6 +44,9 @@ Running the `.py` files needs Python installed. If you'd rather have a self-cont
 
 - No Python packages required — everything uses the standard library (PyInstaller is only needed for the optional standalone app)
 - Cards are detected as they mount under `/Volumes` (FAT32/exFAT, like camera cards format); the Mac's own disks and network shares are ignored
+- If the card is already plugged in when you launch, it's detected right away (real camera cards hold a `DCIM` folder, so FAT-formatted externals aren't mistaken for one)
+- A status panel shows each stage — scanning, copying to primary, copying to backup — with an x-of-y progress bar
+- If a file can't be copied (e.g. a network-backed backup folder rejects metadata), the copy still goes through content-only; persistent failures are listed in the Done message instead of aborting the run
 - Files are flattened into your destination folder (the card's `DCIM/…` structure is ignored)
 - Hidden files and folders are skipped
 - If a file already exists in the destination it gets a ` (1)`, ` (2)`, … suffix instead of overwriting

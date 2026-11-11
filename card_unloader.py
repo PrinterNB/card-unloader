@@ -88,18 +88,46 @@ def _has_entries(path):
         return False
 
 
+def _has_dcim(path):
+    """True if path (or one folder inside it) contains a DCIM folder.
+
+    Camera cards follow the DCF spec and hold their photos in DCIM/, so this
+    tells a real card apart from a FAT-formatted external drive that happens
+    to be mounted at startup.
+    """
+    try:
+        entries = [e for e in os.scandir(path) if e.is_dir()]
+    except OSError:
+        return False
+    if any(e.name.lower() == "dcim" for e in entries):
+        return True
+    for e in entries:
+        try:
+            if any(e2.name.lower() == "dcim" for e2 in os.scandir(e.path) if e2.is_dir()):
+                return True
+        except OSError:
+            pass
+    return False
+
+
 def wait_for_card(root):
     """Show a 'plug in your card' dialog and wait until a card volume appears.
 
-    Triggers when either a new card volume shows up under /Volumes, or a
-    volume that was present but empty starts containing files (some readers
-    keep a permanent mount point and only fill up when a card is inserted).
-    Returns the volume root path, or None if cancelled.
+    A card already mounted when the app started is detected immediately if it
+    looks like a camera card (DCIM folder) — otherwise triggers when either a
+    new card volume shows up under /Volumes, or a volume that was present but
+    empty starts containing files (some readers keep a permanent mount point
+    and only fill up when a card is inserted). Returns the volume root path,
+    or None if cancelled.
     """
     baseline = _candidate_volumes()
     had_content = {p: _has_entries(p) for p in baseline}
     result = [None]
     cancelled = [False]
+
+    already = [p for p in sorted(baseline) if had_content[p] and _has_dcim(p)]
+    if already:
+        return already[0] if len(already) == 1 else pick_drive(root, already)
 
     dialog = tk.Toplevel(root)
     dialog.title("Card Unloader")
@@ -221,6 +249,52 @@ def _launch(path):
         subprocess.Popen([str(path)])
 
 
+def _copy_file(src, dest):
+    """Copy with metadata; fall back to content-only on filesystems that
+    reject them (SMB shares, some external drives). False = both failed."""
+    try:
+        shutil.copy2(src, dest)
+        return True
+    except OSError:
+        try:
+            shutil.copyfile(src, dest)
+            return True
+        except OSError:
+            return False
+
+
+class StatusWindow:
+    """Floating panel showing the current stage and a progress bar."""
+
+    BAR_W = 220
+
+    def __init__(self, root):
+        w = tk.Toplevel(root)
+        w.title("Card Unloader")
+        w.attributes("-topmost", True)
+        w.resizable(False, False)
+        self.label = tk.Label(w, justify="left")
+        self.label.pack(padx=14, pady=(12, 6))
+        self.canvas = tk.Canvas(w, height=18, width=self.BAR_W + 6, border=0)
+        self.canvas.pack(padx=14, pady=(2, 12))
+        self.w = w
+
+    def set(self, text, frac=None):
+        """Show stage text; draw the bar when frac (0..1) is given."""
+        self.label.configure(text=text)
+        c = self.canvas
+        c.delete("all")
+        if frac is not None:
+            frac = min(max(frac, 0.0), 1.0)
+            x0, y0 = 4, 3
+            c.create_rectangle(x0, y0, x0 + self.BAR_W, y0 + 12, outline="#808080")
+            c.create_rectangle(x0, y0, x0 + int(self.BAR_W * frac), y0 + 12, fill="#4a90d9")
+        self.w.update_idletasks()
+
+    def close(self):
+        self.w.destroy()
+
+
 def run_unload(root):
     config = load_config()
     if config is None:
@@ -261,59 +335,86 @@ def run_unload(root):
         return
     card_root = Path(card_path)
 
-    # --- Scan card for matching files (skip hidden files & folders) ---
-    matched = []
-    for dirpath, dirs, files in os.walk(card_root):
-        dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
-        for fname in files:
-            if _is_hidden(os.path.join(dirpath, fname)):
-                continue
-            ext = os.path.splitext(fname)[1].upper().lstrip(".")
-            if ext in extensions:
-                matched.append(Path(dirpath) / fname)
+    # --- Scan, copy, backup with a live status panel ---
+    status = StatusWindow(root)
+    try:
+        status.set("Scanning your card…")
+        matched = []
+        for dirpath, dirs, files in os.walk(card_root):
+            dirs[:] = [d for d in dirs if not _is_hidden(os.path.join(dirpath, d))]
+            for fname in files:
+                if _is_hidden(os.path.join(dirpath, fname)):
+                    continue
+                ext = os.path.splitext(fname)[1].upper().lstrip(".")
+                if ext in extensions:
+                    matched.append(Path(dirpath) / fname)
 
-    if not matched:
-        ext_list = ", ".join(f".{e}" for e in sorted(extensions))
+        if not matched:
+            ext_list = ", ".join(f".{e}" for e in sorted(extensions))
+            messagebox.showinfo(
+                "Card Unloader",
+                f"No matching files found on card.\n\nLooked for: {ext_list}",
+                parent=root,
+            )
+            return
+
+        # --- Copy to primary destination ---
+        primary = Path(primary_dest)
+        total = len(matched)
+        copied, failed = [], []
+        for i, f in enumerate(matched, 1):
+            dest = unique_dest(primary, f.name)
+            if _copy_file(f, dest):
+                copied.append(dest)
+            else:
+                failed.append(f"{f.name} → primary")
+            status.set(f"Copying to primary — {i} of {total}", i / total)
+
+        if not copied:
+            messagebox.showerror(
+                "Card Unloader",
+                f"Could not copy any files to:\n{primary_dest}\n\n"
+                "Check the folder exists and is writable.",
+                parent=root,
+            )
+            return
+
+        # --- Card can be removed ---
         messagebox.showinfo(
             "Card Unloader",
-            f"No matching files found on card.\n\nLooked for: {ext_list}",
+            f"{len(copied)} files copied to:\n{primary_dest}\n\n"
+            "You can safely remove the card.",
             parent=root,
         )
-        return
 
-    # --- Copy to primary destination ---
-    primary = Path(primary_dest)
-    copied = []
-    for f in matched:
-        dest = unique_dest(primary, f.name)
-        shutil.copy2(f, dest)
-        copied.append(dest)
+        # --- Copy to backup ---
+        if backup_dest and os.path.isdir(backup_dest):
+            if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
+                backup = Path(backup_dest)
+                n = len(copied)
+                status.set(f"Copying to backup — 0 of {n}")
+                for j, f in enumerate(copied, 1):
+                    dest = unique_dest(backup, f.name)
+                    if not _copy_file(f, dest):
+                        failed.append(f"{f.name} → backup")
+                    status.set(f"Copying to backup — {j} of {n}", j / n)
 
-    # --- Card can be removed ---
-    messagebox.showinfo(
-        "Card Unloader",
-        f"{len(copied)} files copied to:\n{primary_dest}\n\n"
-        "You can safely remove the card.",
-        parent=root,
-    )
+        # --- Launch Lightroom? ---
+        if lightroom and _is_launchable(lightroom):
+            if messagebox.askyesno("Card Unloader", "Launch Lightroom?", parent=root):
+                status.set("Launching Lightroom…")
+                _launch(lightroom)
 
-    # --- Copy to backup ---
-    if backup_dest and os.path.isdir(backup_dest):
-        if os.path.realpath(primary_dest) != os.path.realpath(backup_dest):
-            backup = Path(backup_dest)
-            for f in copied:
-                dest = unique_dest(backup, f.name)
-                shutil.copy2(f, dest)
-
-    # --- Launch Lightroom? ---
-    if lightroom and _is_launchable(lightroom):
-        if messagebox.askyesno("Card Unloader", "Launch Lightroom?", parent=root):
-            _launch(lightroom)
-
-    # --- Done ---
-    messagebox.showinfo(
-        "Card Unloader", f"Done — {len(copied)} files processed.", parent=root
-    )
+        # --- Done ---
+        done_text = f"Done — {len(copied)} files processed."
+        if failed:
+            done_text += (
+                f"\n\n{len(failed)} could not be copied (destination permission or disk issue):\n"
+                + "\n".join(f"• {t}" for t in failed[:8])
+            )
+        messagebox.showinfo("Card Unloader", done_text, parent=root)
+    finally:
+        status.close()
 
 
 def main():
